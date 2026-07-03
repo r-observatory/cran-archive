@@ -295,6 +295,19 @@ test_that("parse_packages_in: record with only X-CRAN-History (no comment) is ex
   expect_false("histonly" %in% names(out))
 })
 
+test_that("parse_packages_in: a '.' continuation line (Debian blank-line marker) is not folded literally", {
+  txt <- paste(
+    "Package: dotpara",
+    "X-CRAN-Comment: Archived on 2026-06-30 for policy violation.",
+    "  .",
+    "  On Internet access.",
+    "", sep = "\n"
+  )
+  out <- parse_packages_in(txt)
+  expect_equal(out[["dotpara"]], "Archived on 2026-06-30 for policy violation. On Internet access.")
+  expect_false(grepl(" [.] ", out[["dotpara"]]))
+})
+
 test_that("parse_packages_in: record with no X-CRAN-Comment field is excluded", {
   out <- parse_packages_in(.PACKAGES_IN_FIXTURE)
   expect_false("nocomment" %in% names(out))

@@ -237,8 +237,13 @@ parse_packages_in <- function(text) {
         comment_val <- trimws(sub("^X-CRAN-Comment:\\s*", "", line))
         in_comment  <- TRUE
       } else if (in_comment && grepl("^[ \t]", line)) {
-        # Continuation line: fold into accumulator separated by a single space
-        comment_val <- paste(comment_val, trimws(line))
+        # Continuation line. A line whose only content is "." is Debian control's
+        # blank-line-within-a-field marker, so treat it as a paragraph break
+        # rather than folding a literal dot into the text.
+        cont <- trimws(line)
+        if (cont != ".") {
+          comment_val <- paste(comment_val, cont)
+        }
       } else if (grepl("^[A-Za-z]", line)) {
         # Any new field header ends comment accumulation
         in_comment <- FALSE
@@ -246,7 +251,7 @@ parse_packages_in <- function(text) {
     }
 
     if (!is.na(pkg) && !is.null(comment_val)) {
-      final_val <- trimws(comment_val)
+      final_val <- gsub("[ \t]+", " ", trimws(comment_val))
       if (nzchar(final_val)) {
         result[[pkg]] <- final_val
       }
