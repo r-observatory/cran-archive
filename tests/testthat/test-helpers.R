@@ -1,5 +1,5 @@
 # tests/testthat/test-helpers.R: unit tests for parse_archive_version,
-# build_archive, and build_archive_events (no network required).
+# build_archive, build_archive_events, and parse_packages_in (no network required).
 
 # ---------------------------------------------------------------------------
 # Shared fixture builders
@@ -242,4 +242,98 @@ test_that("build_archive_events: 0-row entry is skipped; other packages still em
   out <- build_archive_events(archive_list, character(0))
   expect_false("EmptyPkg" %in% out$package)
   expect_true("PkgSingle" %in% out$package)
+})
+
+# ---------------------------------------------------------------------------
+# parse_packages_in
+# ---------------------------------------------------------------------------
+
+# Fixture covering the four required cases:
+#   (1) epoxy     -- single-line X-CRAN-Comment, CRLF line endings
+#   (2) multiline -- X-CRAN-Comment that continues on a second (indented) line
+#   (3) histonly  -- has X-CRAN-History but NO X-CRAN-Comment  (must be excluded)
+#   (4) nocomment -- only Package + Version fields              (must be excluded)
+.PACKAGES_IN_FIXTURE <- paste0(
+  "Package: epoxy\r\n",
+  "Version: 0.6.0\r\n",
+  "X-CRAN-Comment: Archived on 2026-07-02 as issues were not corrected in time.\r\n",
+  "\r\n",
+  "Package: multiline\n",
+  "X-CRAN-Comment: Archived on 2026-07-02 at the maintainer's request.\n",
+  " Additional context here.\n",
+  "\n",
+  "Package: histonly\n",
+  "X-CRAN-History: Archived on 2024-01-01 for policy reasons.\n",
+  "\n",
+  "Package: nocomment\n",
+  "Version: 1.0\n"
+)
+
+test_that("parse_packages_in: returns exactly the packages that have an X-CRAN-Comment", {
+  out <- parse_packages_in(.PACKAGES_IN_FIXTURE)
+  expect_equal(sort(names(out)), c("epoxy", "multiline"))
+})
+
+test_that("parse_packages_in: single-line X-CRAN-Comment value is stored verbatim (CRLF input)", {
+  out <- parse_packages_in(.PACKAGES_IN_FIXTURE)
+  expect_equal(
+    out[["epoxy"]],
+    "Archived on 2026-07-02 as issues were not corrected in time."
+  )
+})
+
+test_that("parse_packages_in: multi-line X-CRAN-Comment continuation lines are folded with a space", {
+  out <- parse_packages_in(.PACKAGES_IN_FIXTURE)
+  expect_equal(
+    out[["multiline"]],
+    "Archived on 2026-07-02 at the maintainer's request. Additional context here."
+  )
+})
+
+test_that("parse_packages_in: record with only X-CRAN-History (no comment) is excluded", {
+  out <- parse_packages_in(.PACKAGES_IN_FIXTURE)
+  expect_false("histonly" %in% names(out))
+})
+
+test_that("parse_packages_in: record with no X-CRAN-Comment field is excluded", {
+  out <- parse_packages_in(.PACKAGES_IN_FIXTURE)
+  expect_false("nocomment" %in% names(out))
+})
+
+test_that("parse_packages_in: returns character(0) for empty input", {
+  out <- parse_packages_in("")
+  expect_equal(out, character(0))
+})
+
+test_that("parse_packages_in returns a named character vector (not a list)", {
+  out <- parse_packages_in(.PACKAGES_IN_FIXTURE)
+  expect_true(is.character(out))
+  expect_true(!is.null(names(out)))
+})
+
+# ---------------------------------------------------------------------------
+# build_archive integration: reasons from parse_packages_in
+# ---------------------------------------------------------------------------
+
+test_that("build_archive integration: removal_reason populated from parse_packages_in result", {
+  # Use the fixture reasons map; build an archive_list that includes epoxy.
+  reasons <- parse_packages_in(.PACKAGES_IN_FIXTURE)
+  archive_list <- list(
+    epoxy = .make_archive_df("epoxy", c("0.5.0", "0.6.0"),
+                             c("2024-01-01", "2026-07-02"))
+  )
+  out <- build_archive(archive_list, character(0), reasons)
+  expect_equal(
+    out$removal_reason[out$package == "epoxy"],
+    "Archived on 2026-07-02 as issues were not corrected in time."
+  )
+})
+
+test_that("build_archive integration: removal_reason is NA for package absent from parse_packages_in result", {
+  reasons <- parse_packages_in(.PACKAGES_IN_FIXTURE)
+  archive_list <- list(
+    orphan = .make_archive_df("orphan", c("1.0"), c("2023-05-01"))
+  )
+  out <- build_archive(archive_list, character(0), reasons)
+  expect_true(is.na(out$removal_reason[out$package == "orphan"]))
 })

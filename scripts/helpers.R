@@ -199,13 +199,71 @@ write_manifest <- function(path, obj) {
   invisible(NULL)
 }
 
+#' Parse CRAN's PACKAGES.in Debian-control file into a removal-reasons map.
+#'
+#' Reads the text of PACKAGES.in (fetched or provided as a string) and returns
+#' a named character vector mapping package name -> X-CRAN-Comment value.  Only
+#' packages that have an X-CRAN-Comment field are included; packages with no
+#' comment are omitted.  Multi-line field values (continuation lines starting
+#' with whitespace) are folded into a single space-separated string.  Robust to
+#' CRLF and bare CR line endings.  X-CRAN-History fields are ignored.
+#'
+#' @param text  Character scalar: the full text of PACKAGES.in.
+#' @return Named character vector (package -> X-CRAN-Comment).  Returns
+#'   character(0) when no package has a comment.
+parse_packages_in <- function(text) {
+  # Normalize line endings: CRLF and bare CR -> LF
+  text <- gsub("\r\n", "\n", text)
+  text <- gsub("\r",   "\n", text)
+
+  # Split into records on one or more consecutive blank lines
+  records <- strsplit(text, "\n{2,}")[[1L]]
+
+  result <- list()
+
+  for (rec in records) {
+    lines <- strsplit(rec, "\n")[[1L]]
+    if (length(lines) == 0L) next
+
+    pkg         <- NA_character_
+    comment_val <- NULL
+    in_comment  <- FALSE
+
+    for (line in lines) {
+      if (grepl("^Package:", line)) {
+        pkg        <- trimws(sub("^Package:\\s*", "", line))
+        in_comment <- FALSE
+      } else if (grepl("^X-CRAN-Comment:", line)) {
+        comment_val <- trimws(sub("^X-CRAN-Comment:\\s*", "", line))
+        in_comment  <- TRUE
+      } else if (in_comment && grepl("^[ \t]", line)) {
+        # Continuation line: fold into accumulator separated by a single space
+        comment_val <- paste(comment_val, trimws(line))
+      } else if (grepl("^[A-Za-z]", line)) {
+        # Any new field header ends comment accumulation
+        in_comment <- FALSE
+      }
+    }
+
+    if (!is.na(pkg) && !is.null(comment_val)) {
+      final_val <- trimws(comment_val)
+      if (nzchar(final_val)) {
+        result[[pkg]] <- final_val
+      }
+    }
+  }
+
+  if (length(result) == 0L) return(character(0))
+  unlist(result)
+}
+
 #' Default IO providers: real network fetchers for production use.
 #'
 #' Returns a named list of zero-argument functions:
 #'   archive_rds()      -- downloads and returns the CRAN archive.rds named list.
 #'   current_packages() -- returns a character vector of currently-available packages.
-#'   removal_reasons()  -- returns a named character vector (empty by default;
-#'                         override in a future extension to populate reasons).
+#'   removal_reasons()  -- fetches PACKAGES.in and returns a named character vector
+#'                         mapping package name -> X-CRAN-Comment value.
 default_io <- function() {
   list(
     archive_rds = function() {
@@ -217,7 +275,9 @@ default_io <- function() {
     },
 
     removal_reasons = function() {
-      character(0)
+      parse_packages_in(
+        paste(readLines(url(CRAN_PACKAGES_IN_URL), warn = FALSE), collapse = "\n")
+      )
     }
   )
 }
