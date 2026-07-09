@@ -377,6 +377,24 @@ default_io <- function() {
       parse_packages_in(
         paste(readLines(url(CRAN_PACKAGES_IN_URL), warn = FALSE), collapse = "\n")
       )
+    },
+
+    prev_names = function() {
+      empty <- data.frame(name_lower = character(0), canonical_name = character(0),
+                          identity_state = character(0), first_seen = character(0),
+                          last_seen = character(0), stringsAsFactors = FALSE)
+      tmp <- tempfile(); dir.create(tmp, showWarnings = FALSE)
+      on.exit(unlink(tmp, recursive = TRUE), add = TRUE)
+      st <- suppressWarnings(system2("gh",
+        c("release", "download", "current", "--repo", PUBLISH_REPO,
+          "--pattern", DB_FILENAME, "--dir", tmp, "--clobber"),
+        stdout = FALSE, stderr = FALSE))
+      db <- file.path(tmp, DB_FILENAME)
+      if (!identical(as.integer(st), 0L) || !file.exists(db)) return(empty)
+      con <- RSQLite::dbConnect(RSQLite::SQLite(), db)
+      on.exit(RSQLite::dbDisconnect(con), add = TRUE)
+      if (!RSQLite::dbExistsTable(con, "cran_names_all")) return(empty)
+      RSQLite::dbGetQuery(con, "SELECT * FROM cran_names_all")
     }
   )
 }

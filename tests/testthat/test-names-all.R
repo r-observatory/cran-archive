@@ -1,5 +1,16 @@
 # tests/testthat/test-names-all.R: unit tests for build_names_all.
 
+# Source update.R if it has not been loaded already, so run_update is available
+# regardless of test file execution order (mirrors test-run-update.R).
+if (!exists("run_update", mode = "function")) {
+  .candidates <- c(
+    file.path(getwd(), "scripts", "update.R"),
+    file.path(getwd(), "..", "..", "scripts", "update.R")
+  )
+  .upd <- .candidates[file.exists(.candidates)]
+  if (length(.upd)) source(normalizePath(.upd[1L]))
+}
+
 test_that("build_names_all unions archive and live names with a live/archived state", {
   archive_list <- list(maptools = data.frame(), MASS = data.frame(), abc = data.frame())
   current_pkgs <- c("MASS", "ggplot2")
@@ -89,4 +100,31 @@ test_that("export_names_all writes the cran_names_all table", {
   expect_equal(nrow(got), 2L)
   expect_equal(got$canonical_name[got$name_lower == "mass"], "MASS")
   expect_equal(got$identity_state[got$name_lower == "oldpkg"], "archived")
+})
+
+test_that("run_update writes an append-only cran_names_all through injected io", {
+  out_dir <- withr::local_tempdir()
+  prior <- data.frame(
+    name_lower = "oldpkg", canonical_name = "OldPkg", identity_state = "archived",
+    first_seen = "2019-01-01", last_seen = "2025-01-01", stringsAsFactors = FALSE)
+  io <- list(
+    archive_rds      = function() list(maptools = data.frame(mtime = as.POSIXct("2020-01-01"),
+                                                             row.names = "maptools/maptools_1.0.tar.gz"),
+                                       MASS = data.frame(mtime = as.POSIXct("2021-01-01"),
+                                                         row.names = "MASS/MASS_7.3.tar.gz")),
+    current_packages = function() rep("MASS", 1),        # MASS live, maptools archived
+    removal_reasons  = function() character(0),
+    prev_names       = function() prior)
+  # Bypass the size gate for this small fixture by lowering the floors.
+  res <- run_update(io, out_dir, force_full = TRUE, live_floor = 0L, archive_floor = 0L)
+
+  con <- RSQLite::dbConnect(RSQLite::SQLite(), file.path(out_dir, "cran-archive.db"))
+  got <- RSQLite::dbGetQuery(con, "SELECT * FROM cran_names_all ORDER BY name_lower")
+  RSQLite::dbDisconnect(con)
+  expect_setequal(got$name_lower, c("oldpkg", "mass", "maptools"))  # prior retained + new
+  expect_equal(got$identity_state[got$name_lower == "mass"], "live")
+  expect_equal(got$identity_state[got$name_lower == "maptools"], "archived")
+  expect_equal(got$first_seen[got$name_lower == "oldpkg"], "2019-01-01")  # frozen
+  expect_equal(res$manifest$n_names, 3L)
+  expect_true(res$manifest$names_gate_ok)
 })

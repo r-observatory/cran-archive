@@ -43,7 +43,8 @@ iso <- function(t) format(t, "%Y-%m-%dT%H:%M:%SZ", tz = "UTC")
 # run_update
 # ---------------------------------------------------------------------------
 
-run_update <- function(io, out_dir, force_full = FALSE) {
+run_update <- function(io, out_dir, force_full = FALSE,
+                       live_floor = CRAN_LIVE_FLOOR, archive_floor = CRAN_ARCHIVE_FLOOR) {
   dir.create(out_dir, showWarnings = FALSE, recursive = TRUE)
 
   # 1. Fetch data sources via injectable io
@@ -78,6 +79,33 @@ run_update <- function(io, out_dir, force_full = FALSE) {
   db_path <- file.path(out_dir, DB_FILENAME)
   export_archive(db_path, archive_df, events_df)
 
+  # Append-only cran_names_all: union archive + live names, gated against a
+  # partial fetch, folded into the prior published table.
+  n_live      <- length(current_pkgs)
+  n_arch      <- length(archive_list)
+  names_gate_ok <- names_size_ok(n_live, n_arch, live_floor, archive_floor)
+  n_names <- NA_integer_
+  if (names_gate_ok) {
+    snapshot  <- build_names_all(archive_list, current_pkgs)
+    prior     <- tryCatch(io$prev_names(), error = function(e) NULL)
+    now_stamp <- format(Sys.time(), "%Y-%m-%d", tz = "UTC")
+    merged    <- merge_names_all(prior, snapshot, now_stamp)
+    con <- RSQLite::dbConnect(RSQLite::SQLite(), db_path)
+    export_names_all(con, merged)
+    RSQLite::dbDisconnect(con)
+    n_names <- nrow(merged)
+  } else {
+    message("names size gate failed (live=", n_live, ", archive=", n_arch,
+            "); reusing the prior cran_names_all")
+    prior <- tryCatch(io$prev_names(), error = function(e) NULL)
+    if (!is.null(prior) && nrow(prior) > 0L) {
+      con <- RSQLite::dbConnect(RSQLite::SQLite(), db_path)
+      export_names_all(con, prior)   # reuse last known good; never shrink or drop the table
+      RSQLite::dbDisconnect(con)
+      n_names <- nrow(prior)
+    }
+  }
+
   # 6. Write manifest
   manifest <- list(
     release             = paste0("v", format(Sys.time(), "%Y%m%d-%H%M%S", tz = "UTC")),
@@ -85,6 +113,8 @@ run_update <- function(io, out_dir, force_full = FALSE) {
     n_archived          = nrow(archive_df),
     n_events            = nrow(events_df),
     changed             = changed,
+    n_names             = n_names,
+    names_gate_ok       = names_gate_ok,
     source              = list(
       archive_fingerprint = archive_fingerprint
     )
