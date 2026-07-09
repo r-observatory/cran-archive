@@ -262,6 +262,29 @@ parse_packages_in <- function(text) {
   unlist(result)
 }
 
+#' Build the per-run CRAN name snapshot: every name in the archive index or the
+#' live CRAN listing, with identity_state = "live" when currently available else
+#' "archived". Casing is preserved verbatim from CRAN. One row per name_lower;
+#' a case collision keeps the live entry.
+build_names_all <- function(archive_list, current_pkgs) {
+  all_names <- union(names(archive_list), current_pkgs)
+  if (length(all_names) == 0L) {
+    return(data.frame(name_lower = character(0), canonical_name = character(0),
+                      identity_state = character(0), stringsAsFactors = FALSE))
+  }
+  df <- data.frame(
+    name_lower     = tolower(all_names),
+    canonical_name = all_names,
+    identity_state = ifelse(all_names %in% current_pkgs, "live", "archived"),
+    stringsAsFactors = FALSE
+  )
+  # A case collision (two CRAN names differing only in case) keeps the live row.
+  df <- df[order(df$name_lower, df$identity_state != "live"), , drop = FALSE]
+  df <- df[!duplicated(df$name_lower), , drop = FALSE]
+  rownames(df) <- NULL
+  df
+}
+
 #' Default IO providers: real network fetchers for production use.
 #'
 #' Returns a named list of zero-argument functions:
