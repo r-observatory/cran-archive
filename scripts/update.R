@@ -81,29 +81,29 @@ run_update <- function(io, out_dir, force_full = FALSE,
 
   # Append-only cran_names_all: union archive + live names, gated against a
   # partial fetch, folded into the prior published table.
-  n_live      <- length(current_pkgs)
-  n_arch      <- length(archive_list)
+  n_live        <- length(current_pkgs)
+  n_arch        <- length(archive_list)
   names_gate_ok <- names_size_ok(n_live, n_arch, live_floor, archive_floor)
+  prior         <- tryCatch(io$prev_names(), error = function(e) NULL)
+  names_healthy <- !is.null(prior)   # NULL means prev_names threw: prior is UNREACHABLE
   n_names <- NA_integer_
-  if (names_gate_ok) {
-    snapshot  <- build_names_all(archive_list, current_pkgs)
-    prior     <- tryCatch(io$prev_names(), error = function(e) NULL)
-    now_stamp <- format(Sys.time(), "%Y-%m-%d", tz = "UTC")
-    merged    <- merge_names_all(prior, snapshot, now_stamp)
+  now_stamp <- format(Sys.time(), "%Y-%m-%d", tz = "UTC")
+  if (!names_healthy) {
+    # A transient prior-fetch failure must never cold-start and reset first_seen.
+    message("prior cran_names_all unreachable; skipping the names write this run")
+  } else if (names_gate_ok) {
+    merged <- merge_names_all(prior, build_names_all(archive_list, current_pkgs), now_stamp)
     con <- RSQLite::dbConnect(RSQLite::SQLite(), db_path)
     on.exit(RSQLite::dbDisconnect(con), add = TRUE)
     export_names_all(con, merged)
     n_names <- nrow(merged)
-  } else {
+  } else if (nrow(prior) > 0L) {
     message("names size gate failed (live=", n_live, ", archive=", n_arch,
             "); reusing the prior cran_names_all")
-    prior <- tryCatch(io$prev_names(), error = function(e) NULL)
-    if (!is.null(prior) && nrow(prior) > 0L) {
-      con <- RSQLite::dbConnect(RSQLite::SQLite(), db_path)
-      on.exit(RSQLite::dbDisconnect(con), add = TRUE)
-      export_names_all(con, prior)   # reuse last known good; never shrink or drop the table
-      n_names <- nrow(prior)
-    }
+    con <- RSQLite::dbConnect(RSQLite::SQLite(), db_path)
+    on.exit(RSQLite::dbDisconnect(con), add = TRUE)
+    export_names_all(con, prior)
+    n_names <- nrow(prior)
   }
 
   # 6. Write manifest
@@ -115,6 +115,7 @@ run_update <- function(io, out_dir, force_full = FALSE,
     changed             = changed,
     n_names             = n_names,
     names_gate_ok       = names_gate_ok,
+    names_healthy       = names_healthy,
     source              = list(
       archive_fingerprint = archive_fingerprint
     )

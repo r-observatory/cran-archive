@@ -149,3 +149,19 @@ test_that("run_update reuses the prior cran_names_all when the size gate fails",
   expect_equal(got$first_seen, "2018-01-01")    # prior first_seen preserved
   expect_false(res$manifest$names_gate_ok)
 })
+
+test_that("run_update does not cold-start cran_names_all when the prior is unreachable", {
+  out_dir <- withr::local_tempdir()
+  io <- list(
+    archive_rds = function() list(tiny = data.frame(mtime = as.POSIXct("2020-01-01"),
+                                                    row.names = "tiny/tiny_1.0.tar.gz")),
+    current_packages = function() character(0),
+    removal_reasons = function() character(0),
+    prev_names = function() stop("prior release unreachable"))
+  res <- run_update(io, out_dir, force_full = TRUE, live_floor = 0L, archive_floor = 0L)
+  con <- RSQLite::dbConnect(RSQLite::SQLite(), file.path(out_dir, "cran-archive.db"))
+  has_tbl <- RSQLite::dbExistsTable(con, "cran_names_all")
+  RSQLite::dbDisconnect(con)
+  expect_false(has_tbl)                 # no names written when prior is unreachable
+  expect_false(res$manifest$names_healthy)
+})

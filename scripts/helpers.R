@@ -390,9 +390,16 @@ default_io <- function() {
           "--pattern", DB_FILENAME, "--dir", tmp, "--clobber"),
         stdout = FALSE, stderr = FALSE))
       db <- file.path(tmp, DB_FILENAME)
-      if (!identical(as.integer(st), 0L) || !file.exists(db)) return(empty)
+      # A failed download is a transient/network problem, not evidence that no
+      # table has ever been published. Throw so the caller can tell this apart
+      # from a genuine cold start and avoid resetting first_seen for everyone.
+      if (!identical(as.integer(st), 0L) || !file.exists(db)) {
+        stop("prior release unreachable")
+      }
       con <- RSQLite::dbConnect(RSQLite::SQLite(), db)
       on.exit(RSQLite::dbDisconnect(con), add = TRUE)
+      # A successful download with no cran_names_all table is the genuine
+      # cold-start case: the table has simply never been published yet.
       if (!RSQLite::dbExistsTable(con, "cran_names_all")) return(empty)
       RSQLite::dbGetQuery(con, "SELECT * FROM cran_names_all")
     }
