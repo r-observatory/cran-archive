@@ -91,8 +91,8 @@ run_update <- function(io, out_dir, force_full = FALSE,
     now_stamp <- format(Sys.time(), "%Y-%m-%d", tz = "UTC")
     merged    <- merge_names_all(prior, snapshot, now_stamp)
     con <- RSQLite::dbConnect(RSQLite::SQLite(), db_path)
+    on.exit(RSQLite::dbDisconnect(con), add = TRUE)
     export_names_all(con, merged)
-    RSQLite::dbDisconnect(con)
     n_names <- nrow(merged)
   } else {
     message("names size gate failed (live=", n_live, ", archive=", n_arch,
@@ -100,8 +100,8 @@ run_update <- function(io, out_dir, force_full = FALSE,
     prior <- tryCatch(io$prev_names(), error = function(e) NULL)
     if (!is.null(prior) && nrow(prior) > 0L) {
       con <- RSQLite::dbConnect(RSQLite::SQLite(), db_path)
+      on.exit(RSQLite::dbDisconnect(con), add = TRUE)
       export_names_all(con, prior)   # reuse last known good; never shrink or drop the table
-      RSQLite::dbDisconnect(con)
       n_names <- nrow(prior)
     }
   }

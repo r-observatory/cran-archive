@@ -128,3 +128,24 @@ test_that("run_update writes an append-only cran_names_all through injected io",
   expect_equal(res$manifest$n_names, 3L)
   expect_true(res$manifest$names_gate_ok)
 })
+
+test_that("run_update reuses the prior cran_names_all when the size gate fails", {
+  out_dir <- withr::local_tempdir()
+  prior <- data.frame(name_lower = "keepme", canonical_name = "KeepMe",
+                      identity_state = "archived", first_seen = "2018-01-01",
+                      last_seen = "2025-01-01", stringsAsFactors = FALSE)
+  io <- list(
+    archive_rds = function() list(tiny = data.frame(mtime = as.POSIXct("2020-01-01"),
+                                                    row.names = "tiny/tiny_1.0.tar.gz")),
+    current_packages = function() character(0),
+    removal_reasons = function() character(0),
+    prev_names = function() prior)
+  # default floors (15000/20000): the 1-name fixture fails the gate
+  res <- run_update(io, out_dir, force_full = TRUE)
+  con <- RSQLite::dbConnect(RSQLite::SQLite(), file.path(out_dir, "cran-archive.db"))
+  got <- RSQLite::dbGetQuery(con, "SELECT * FROM cran_names_all")
+  RSQLite::dbDisconnect(con)
+  expect_setequal(got$name_lower, "keepme")     # prior reused, not the tiny snapshot
+  expect_equal(got$first_seen, "2018-01-01")    # prior first_seen preserved
+  expect_false(res$manifest$names_gate_ok)
+})
