@@ -285,6 +285,48 @@ build_names_all <- function(archive_list, current_pkgs) {
   df
 }
 
+#' Fold a per-run name snapshot into the prior published table, append-only.
+#'
+#' Prior rows are never dropped; their first_seen and canonical_name are frozen.
+#' identity_state and last_seen are refreshed for names still present this run;
+#' a name that vanished upstream keeps its prior state. New names get
+#' first_seen = last_seen = now. `prior_df` may be NULL or 0-row.
+#'
+#' @param prior_df   Prior published table, or NULL for a cold start.
+#' @param current_df Per-run snapshot from build_names_all.
+#' @param now        ISO 8601 date string for this run (e.g., "2026-07-09").
+#' @return data.frame(name_lower, canonical_name, identity_state, first_seen,
+#'   last_seen), one row per name in prior_df or current_df, sorted by name_lower.
+merge_names_all <- function(prior_df, current_df, now) {
+  cols  <- c("name_lower", "canonical_name", "identity_state", "first_seen", "last_seen")
+  empty <- data.frame(name_lower = character(0), canonical_name = character(0),
+                      identity_state = character(0), first_seen = character(0),
+                      last_seen = character(0), stringsAsFactors = FALSE)
+  if (is.null(prior_df) || nrow(prior_df) == 0L) prior_df <- empty
+
+  cur_state <- current_df$identity_state
+  names(cur_state) <- current_df$name_lower
+
+  out_prior <- prior_df[, cols, drop = FALSE]
+  present   <- out_prior$name_lower %in% current_df$name_lower
+  st        <- out_prior$identity_state
+  st[present] <- unname(cur_state[out_prior$name_lower[present]])
+  out_prior$identity_state <- st
+  out_prior$last_seen      <- rep_len(now, nrow(out_prior))
+
+  fresh <- current_df[!(current_df$name_lower %in% prior_df$name_lower), , drop = FALSE]
+  out_fresh <- if (nrow(fresh) > 0L) {
+    data.frame(name_lower = fresh$name_lower, canonical_name = fresh$canonical_name,
+               identity_state = fresh$identity_state, first_seen = now, last_seen = now,
+               stringsAsFactors = FALSE)
+  } else empty
+
+  out <- rbind(out_prior, out_fresh)
+  out <- out[order(out$name_lower), , drop = FALSE]
+  rownames(out) <- NULL
+  out
+}
+
 #' Default IO providers: real network fetchers for production use.
 #'
 #' Returns a named list of zero-argument functions:

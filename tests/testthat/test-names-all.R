@@ -26,3 +26,36 @@ test_that("build_names_all keeps the live entry on a case collision", {
   expect_equal(hit$canonical_name, "foo")
   expect_equal(hit$identity_state, "live")
 })
+
+test_that("merge_names_all is append-only and freezes first_seen and casing", {
+  prior <- data.frame(
+    name_lower = c("mass", "oldpkg"), canonical_name = c("MASS", "OldPkg"),
+    identity_state = c("live", "archived"),
+    first_seen = c("2020-01-01", "2019-05-05"),
+    last_seen  = c("2026-01-01", "2026-01-01"), stringsAsFactors = FALSE)
+  current <- data.frame(
+    name_lower = c("mass", "newpkg"), canonical_name = c("MASS", "NewPkg"),
+    identity_state = c("archived", "live"), stringsAsFactors = FALSE)
+
+  out <- merge_names_all(prior, current, now = "2026-07-09")
+
+  expect_setequal(out$name_lower, c("mass", "oldpkg", "newpkg"))
+  m <- out[out$name_lower == "mass", ]
+  expect_equal(m$first_seen, "2020-01-01")    # frozen from prior
+  expect_equal(m$identity_state, "archived")  # refreshed from this run
+  expect_equal(m$last_seen, "2026-07-09")     # touched
+  # a name that vanished upstream this run is retained, not dropped
+  old <- out[out$name_lower == "oldpkg", ]
+  expect_equal(old$canonical_name, "OldPkg")
+  expect_equal(old$identity_state, "archived")
+  expect_equal(old$last_seen, "2026-07-09")
+  # a brand-new name gets first_seen = now
+  new <- out[out$name_lower == "newpkg", ]
+  expect_equal(new$first_seen, "2026-07-09")
+  expect_equal(new$canonical_name, "NewPkg")
+
+  # cold start: NULL prior yields all-new rows
+  cold <- merge_names_all(NULL, current, now = "2026-07-09")
+  expect_setequal(cold$name_lower, c("mass", "newpkg"))
+  expect_true(all(cold$first_seen == "2026-07-09"))
+})
