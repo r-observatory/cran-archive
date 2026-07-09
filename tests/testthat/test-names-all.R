@@ -34,7 +34,7 @@ test_that("merge_names_all is append-only and freezes first_seen and casing", {
     first_seen = c("2020-01-01", "2019-05-05"),
     last_seen  = c("2026-01-01", "2026-01-01"), stringsAsFactors = FALSE)
   current <- data.frame(
-    name_lower = c("mass", "newpkg"), canonical_name = c("MASS", "NewPkg"),
+    name_lower = c("mass", "newpkg"), canonical_name = c("mass", "NewPkg"),
     identity_state = c("archived", "live"), stringsAsFactors = FALSE)
 
   out <- merge_names_all(prior, current, now = "2026-07-09")
@@ -42,6 +42,7 @@ test_that("merge_names_all is append-only and freezes first_seen and casing", {
   expect_setequal(out$name_lower, c("mass", "oldpkg", "newpkg"))
   m <- out[out$name_lower == "mass", ]
   expect_equal(m$first_seen, "2020-01-01")    # frozen from prior
+  expect_equal(m$canonical_name, "MASS")      # canonical frozen from prior, not taken from current
   expect_equal(m$identity_state, "archived")  # refreshed from this run
   expect_equal(m$last_seen, "2026-07-09")     # touched
   # a name that vanished upstream this run is retained, not dropped
@@ -58,4 +59,12 @@ test_that("merge_names_all is append-only and freezes first_seen and casing", {
   cold <- merge_names_all(NULL, current, now = "2026-07-09")
   expect_setequal(cold$name_lower, c("mass", "newpkg"))
   expect_true(all(cold$first_seen == "2026-07-09"))
+
+  # explicit 0-row prior (distinct from NULL) also cold-starts cleanly
+  zero_prior <- data.frame(name_lower = character(0), canonical_name = character(0),
+                           identity_state = character(0), first_seen = character(0),
+                           last_seen = character(0), stringsAsFactors = FALSE)
+  z <- merge_names_all(zero_prior, current, now = "2026-07-09")
+  expect_setequal(z$name_lower, c("mass", "newpkg"))
+  expect_true(all(z$first_seen == "2026-07-09"))
 })
