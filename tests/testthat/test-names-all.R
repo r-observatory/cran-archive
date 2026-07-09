@@ -68,3 +68,25 @@ test_that("merge_names_all is append-only and freezes first_seen and casing", {
   expect_setequal(z$name_lower, c("mass", "newpkg"))
   expect_true(all(z$first_seen == "2026-07-09"))
 })
+
+test_that("names_size_ok rejects a partial or empty fetch", {
+  expect_true(names_size_ok(20000, 28000))
+  expect_false(names_size_ok(500, 28000))      # live CRAN came back short
+  expect_false(names_size_ok(20000, 3))        # archive came back short
+  expect_false(names_size_ok(0, 0))
+})
+
+test_that("export_names_all writes the cran_names_all table", {
+  path <- tempfile(fileext = ".db")
+  on.exit(unlink(path))
+  con <- RSQLite::dbConnect(RSQLite::SQLite(), path)
+  df <- data.frame(name_lower = c("mass", "oldpkg"), canonical_name = c("MASS", "OldPkg"),
+                   identity_state = c("live", "archived"),
+                   first_seen = "2026-07-09", last_seen = "2026-07-09", stringsAsFactors = FALSE)
+  export_names_all(con, df)
+  got <- RSQLite::dbGetQuery(con, "SELECT * FROM cran_names_all ORDER BY name_lower")
+  RSQLite::dbDisconnect(con)
+  expect_equal(nrow(got), 2L)
+  expect_equal(got$canonical_name[got$name_lower == "mass"], "MASS")
+  expect_equal(got$identity_state[got$name_lower == "oldpkg"], "archived")
+})

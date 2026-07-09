@@ -327,6 +327,35 @@ merge_names_all <- function(prior_df, current_df, now) {
   out
 }
 
+#' Reject a partial or empty name fetch. Returns FALSE when the live-CRAN or
+#' archive-index count is below its floor, signalling the caller to reuse the
+#' prior published database rather than publish a shrunken one.
+names_size_ok <- function(n_live, n_archive,
+                          live_floor = CRAN_LIVE_FLOOR,
+                          archive_floor = CRAN_ARCHIVE_FLOOR) {
+  is.finite(n_live) && is.finite(n_archive) &&
+    n_live >= live_floor && n_archive >= archive_floor
+}
+
+#' Write the cran_names_all table into an open connection.
+export_names_all <- function(con, names_df) {
+  RSQLite::dbExecute(con, "DROP TABLE IF EXISTS cran_names_all")
+  RSQLite::dbExecute(con, "
+    CREATE TABLE cran_names_all (
+      name_lower     TEXT PRIMARY KEY,
+      canonical_name TEXT NOT NULL,
+      identity_state TEXT NOT NULL,
+      first_seen     TEXT NOT NULL,
+      last_seen      TEXT NOT NULL
+    )")
+  if (nrow(names_df) > 0L) {
+    RSQLite::dbWriteTable(con, "cran_names_all",
+      names_df[, c("name_lower", "canonical_name", "identity_state",
+                   "first_seen", "last_seen"), drop = FALSE], append = TRUE)
+  }
+  invisible(NULL)
+}
+
 #' Default IO providers: real network fetchers for production use.
 #'
 #' Returns a named list of zero-argument functions:
