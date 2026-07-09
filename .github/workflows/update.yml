@@ -39,6 +39,8 @@ jobs:
       - name: Run unit tests
         run: Rscript tests/testthat.R
       - name: Build archive database
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           mkdir -p out
           if [ "${{ inputs.bootstrap }}" = "true" ]; then
@@ -52,13 +54,19 @@ jobs:
         run: |
           set -euo pipefail
           CHANGED=$(jq -r '.changed' out/manifest.json)
+          NAMES_HEALTHY=$(jq -r '.names_healthy' out/manifest.json)
           if ! gh release view current >/dev/null 2>&1; then
             git tag -f current
             git push -f origin current || true
             gh release create current --title "CRAN Archive (rolling)" --notes "Rolling record of CRAN packages removed from the live listing, with archival dates." --latest
             CHANGED=true
           fi
-          if [ "$CHANGED" = "true" ]; then
+          # Publish on any healthy run (covers a newly-live-only package, which
+          # never moves the archive fingerprint that CHANGED tracks) and skip
+          # entirely when names_healthy is false: that means the prior
+          # cran_names_all was unreachable this run, so out/cran-archive.db has
+          # no names table and must not clobber the last known good release.
+          if [ "$NAMES_HEALTHY" != "false" ]; then
             gh release upload current out/cran-archive.db --clobber
             gh release upload current out/manifest.json --clobber
           fi

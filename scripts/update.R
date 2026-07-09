@@ -43,7 +43,8 @@ iso <- function(t) format(t, "%Y-%m-%dT%H:%M:%SZ", tz = "UTC")
 # run_update
 # ---------------------------------------------------------------------------
 
-run_update <- function(io, out_dir, force_full = FALSE) {
+run_update <- function(io, out_dir, force_full = FALSE,
+                       live_floor = CRAN_LIVE_FLOOR, archive_floor = CRAN_ARCHIVE_FLOOR) {
   dir.create(out_dir, showWarnings = FALSE, recursive = TRUE)
 
   # 1. Fetch data sources via injectable io
@@ -78,6 +79,33 @@ run_update <- function(io, out_dir, force_full = FALSE) {
   db_path <- file.path(out_dir, DB_FILENAME)
   export_archive(db_path, archive_df, events_df)
 
+  # Append-only cran_names_all: union archive + live names, gated against a
+  # partial fetch, folded into the prior published table.
+  n_live        <- length(current_pkgs)
+  n_arch        <- length(archive_list)
+  names_gate_ok <- names_size_ok(n_live, n_arch, live_floor, archive_floor)
+  prior         <- tryCatch(io$prev_names(), error = function(e) NULL)
+  names_healthy <- !is.null(prior)   # NULL means prev_names threw: prior is UNREACHABLE
+  n_names <- NA_integer_
+  now_stamp <- format(Sys.time(), "%Y-%m-%d", tz = "UTC")
+  if (!names_healthy) {
+    # A transient prior-fetch failure must never cold-start and reset first_seen.
+    message("prior cran_names_all unreachable; skipping the names write this run")
+  } else if (names_gate_ok) {
+    merged <- merge_names_all(prior, build_names_all(archive_list, current_pkgs), now_stamp)
+    con <- RSQLite::dbConnect(RSQLite::SQLite(), db_path)
+    on.exit(RSQLite::dbDisconnect(con), add = TRUE)
+    export_names_all(con, merged)
+    n_names <- nrow(merged)
+  } else if (nrow(prior) > 0L) {
+    message("names size gate failed (live=", n_live, ", archive=", n_arch,
+            "); reusing the prior cran_names_all")
+    con <- RSQLite::dbConnect(RSQLite::SQLite(), db_path)
+    on.exit(RSQLite::dbDisconnect(con), add = TRUE)
+    export_names_all(con, prior)
+    n_names <- nrow(prior)
+  }
+
   # 6. Write manifest
   manifest <- list(
     release             = paste0("v", format(Sys.time(), "%Y%m%d-%H%M%S", tz = "UTC")),
@@ -85,6 +113,9 @@ run_update <- function(io, out_dir, force_full = FALSE) {
     n_archived          = nrow(archive_df),
     n_events            = nrow(events_df),
     changed             = changed,
+    n_names             = n_names,
+    names_gate_ok       = names_gate_ok,
+    names_healthy       = names_healthy,
     source              = list(
       archive_fingerprint = archive_fingerprint
     )

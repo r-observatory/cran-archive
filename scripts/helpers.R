@@ -262,6 +262,100 @@ parse_packages_in <- function(text) {
   unlist(result)
 }
 
+#' Build the per-run CRAN name snapshot: every name in the archive index or the
+#' live CRAN listing, with identity_state = "live" when currently available else
+#' "archived". Casing is preserved verbatim from CRAN. One row per name_lower;
+#' a case collision keeps the live entry.
+build_names_all <- function(archive_list, current_pkgs) {
+  all_names <- union(names(archive_list), current_pkgs)
+  if (length(all_names) == 0L) {
+    return(data.frame(name_lower = character(0), canonical_name = character(0),
+                      identity_state = character(0), stringsAsFactors = FALSE))
+  }
+  df <- data.frame(
+    name_lower     = tolower(all_names),
+    canonical_name = all_names,
+    identity_state = ifelse(all_names %in% current_pkgs, "live", "archived"),
+    stringsAsFactors = FALSE
+  )
+  # A case collision (two CRAN names differing only in case) keeps the live row.
+  df <- df[order(df$name_lower, df$identity_state != "live"), , drop = FALSE]
+  df <- df[!duplicated(df$name_lower), , drop = FALSE]
+  rownames(df) <- NULL
+  df
+}
+
+#' Fold a per-run name snapshot into the prior published table, append-only.
+#'
+#' Prior rows are never dropped; their first_seen and canonical_name are frozen.
+#' identity_state and last_seen are refreshed for names still present this run;
+#' a name that vanished upstream keeps its prior state. New names get
+#' first_seen = last_seen = now. `prior_df` may be NULL or 0-row.
+#'
+#' @param prior_df   Prior published table, or NULL for a cold start.
+#' @param current_df Per-run snapshot from build_names_all.
+#' @param now        ISO 8601 date string for this run (e.g., "2026-07-09").
+#' @return data.frame(name_lower, canonical_name, identity_state, first_seen,
+#'   last_seen), one row per name in prior_df or current_df, sorted by name_lower.
+merge_names_all <- function(prior_df, current_df, now) {
+  cols  <- c("name_lower", "canonical_name", "identity_state", "first_seen", "last_seen")
+  empty <- data.frame(name_lower = character(0), canonical_name = character(0),
+                      identity_state = character(0), first_seen = character(0),
+                      last_seen = character(0), stringsAsFactors = FALSE)
+  if (is.null(prior_df) || nrow(prior_df) == 0L) prior_df <- empty
+
+  cur_state <- current_df$identity_state
+  names(cur_state) <- current_df$name_lower
+
+  out_prior <- prior_df[, cols, drop = FALSE]
+  present   <- out_prior$name_lower %in% current_df$name_lower
+  st        <- out_prior$identity_state
+  st[present] <- unname(cur_state[out_prior$name_lower[present]])
+  out_prior$identity_state <- st
+  out_prior$last_seen      <- rep_len(now, nrow(out_prior))
+
+  fresh <- current_df[!(current_df$name_lower %in% prior_df$name_lower), , drop = FALSE]
+  out_fresh <- if (nrow(fresh) > 0L) {
+    data.frame(name_lower = fresh$name_lower, canonical_name = fresh$canonical_name,
+               identity_state = fresh$identity_state, first_seen = now, last_seen = now,
+               stringsAsFactors = FALSE)
+  } else empty
+
+  out <- rbind(out_prior, out_fresh)
+  out <- out[order(out$name_lower), , drop = FALSE]
+  rownames(out) <- NULL
+  out
+}
+
+#' Reject a partial or empty name fetch. Returns FALSE when the live-CRAN or
+#' archive-index count is below its floor, signalling the caller to reuse the
+#' prior published database rather than publish a shrunken one.
+names_size_ok <- function(n_live, n_archive,
+                          live_floor = CRAN_LIVE_FLOOR,
+                          archive_floor = CRAN_ARCHIVE_FLOOR) {
+  is.finite(n_live) && is.finite(n_archive) &&
+    n_live >= live_floor && n_archive >= archive_floor
+}
+
+#' Write the cran_names_all table into an open connection.
+export_names_all <- function(con, names_df) {
+  RSQLite::dbExecute(con, "DROP TABLE IF EXISTS cran_names_all")
+  RSQLite::dbExecute(con, "
+    CREATE TABLE cran_names_all (
+      name_lower     TEXT PRIMARY KEY,
+      canonical_name TEXT NOT NULL,
+      identity_state TEXT NOT NULL,
+      first_seen     TEXT NOT NULL,
+      last_seen      TEXT NOT NULL
+    )")
+  if (nrow(names_df) > 0L) {
+    RSQLite::dbWriteTable(con, "cran_names_all",
+      names_df[, c("name_lower", "canonical_name", "identity_state",
+                   "first_seen", "last_seen"), drop = FALSE], append = TRUE)
+  }
+  invisible(NULL)
+}
+
 #' Default IO providers: real network fetchers for production use.
 #'
 #' Returns a named list of zero-argument functions:
@@ -283,6 +377,31 @@ default_io <- function() {
       parse_packages_in(
         paste(readLines(url(CRAN_PACKAGES_IN_URL), warn = FALSE), collapse = "\n")
       )
+    },
+
+    prev_names = function() {
+      empty <- data.frame(name_lower = character(0), canonical_name = character(0),
+                          identity_state = character(0), first_seen = character(0),
+                          last_seen = character(0), stringsAsFactors = FALSE)
+      tmp <- tempfile(); dir.create(tmp, showWarnings = FALSE)
+      on.exit(unlink(tmp, recursive = TRUE), add = TRUE)
+      st <- suppressWarnings(system2("gh",
+        c("release", "download", "current", "--repo", PUBLISH_REPO,
+          "--pattern", DB_FILENAME, "--dir", tmp, "--clobber"),
+        stdout = FALSE, stderr = FALSE))
+      db <- file.path(tmp, DB_FILENAME)
+      # A failed download is a transient/network problem, not evidence that no
+      # table has ever been published. Throw so the caller can tell this apart
+      # from a genuine cold start and avoid resetting first_seen for everyone.
+      if (!identical(as.integer(st), 0L) || !file.exists(db)) {
+        stop("prior release unreachable")
+      }
+      con <- RSQLite::dbConnect(RSQLite::SQLite(), db)
+      on.exit(RSQLite::dbDisconnect(con), add = TRUE)
+      # A successful download with no cran_names_all table is the genuine
+      # cold-start case: the table has simply never been published yet.
+      if (!RSQLite::dbExistsTable(con, "cran_names_all")) return(empty)
+      RSQLite::dbGetQuery(con, "SELECT * FROM cran_names_all")
     }
   )
 }
