@@ -16,3 +16,13 @@ test_that("build_names_all unions archive and live names with a live/archived st
   # empty inputs yield a typed 0-row frame
   expect_equal(nrow(build_names_all(list(), character(0))), 0L)
 })
+
+test_that("build_names_all keeps the live entry on a case collision", {
+  # "Foo" appears archived-cased in the archive index; "foo" is live under a
+  # different case. They collide on name_lower and the live entry must win.
+  df <- build_names_all(list(Foo = data.frame()), c("foo"))
+  hit <- df[df$name_lower == "foo", ]
+  expect_equal(nrow(hit), 1L)
+  expect_equal(hit$canonical_name, "foo")
+  expect_equal(hit$identity_state, "live")
+})
