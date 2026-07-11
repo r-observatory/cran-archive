@@ -582,6 +582,31 @@ test_that("canon_action: an unknown verb is NA", {
 })
 
 # ---------------------------------------------------------------------------
+# event_reason
+# ---------------------------------------------------------------------------
+
+test_that("event_reason: dated event keeps the cause after the connector", {
+  expect_equal(event_reason("Archived on 2017-12-18 as had new/delete mismatches.",
+                            "2017-12-18"),
+               "had new/delete mismatches")
+  expect_equal(event_reason("Orphaned on 2013-11-12 for policy violations.",
+                            "2013-11-12"),
+               "policy violations")
+})
+
+test_that("event_reason: dated event with no cause is NA (no action echo)", {
+  expect_true(is.na(event_reason("Unarchived on 2020-02-13.", "2020-02-13")))
+  expect_true(is.na(event_reason("Unarchived/Unorphaned on 2019-09-24.", "2019-09-24")))
+  expect_true(is.na(event_reason("Removed on 2021-05-01.", "2021-05-01")))
+})
+
+test_that("event_reason: undated event keeps the line as its cause", {
+  expect_equal(event_reason("Versions 0.30 and 0.32 were removed for copyright violations.",
+                            NA_character_),
+               "Versions 0.30 and 0.32 were removed for copyright violations")
+})
+
+# ---------------------------------------------------------------------------
 # parse_event_lines
 # ---------------------------------------------------------------------------
 
@@ -598,6 +623,9 @@ test_that("parse_event_lines: three dated events in order with cleaned reasons",
                c("2013-11-12", "2017-12-18", "2020-02-13"))
   expect_equal(ev[[1]]$reason, "the maintainer failed to respond")
   expect_equal(ev[[2]]$reason, "had new/delete mismatches")
+  # A dated event with no cause after the date (an unarchival) stores NA, not
+  # an echo of its own action line.
+  expect_true(is.na(ev[[3]]$reason))
 })
 
 test_that("parse_event_lines: a continuation line folds into the current event reason", {
@@ -613,6 +641,7 @@ test_that("parse_event_lines: a continuation line folds into the current event r
                "check problems were not corrected despite reminder Dangerous compilation flags")
   expect_equal(ev[[2]]$action, "unarchived")
   expect_equal(ev[[2]]$date,   "2018-03-03")
+  expect_true(is.na(ev[[2]]$reason))
 })
 
 test_that("parse_event_lines: an undated 'Versions ... removed' line yields a removed event", {

@@ -629,12 +629,30 @@ canon_action <- function(verb) {
                     "Removed", "Renamed", "Replaced", "Restored",
                     "Reinstated", "Deprecated")
 
+#' Cause for a lineage event line. For a dated event, the text after the first ISO
+#' date with a leading "as"/"for"/"at" connector removed, or NA when there is no
+#' cause (e.g. "Unarchived on 2020-02-13." has nothing after the date). For an
+#' undated event, the line itself (a descriptive cause such as a version-range
+#' removal), trailing period trimmed.
+event_reason <- function(line, date) {
+  if (is.na(date)) {
+    r <- sub("[ .]+$", "", gsub("[[:space:]]+", " ", trimws(line)))
+    return(if (nzchar(r)) r else NA_character_)
+  }
+  after <- sub("^.*?[0-9]{4}-[0-9]{2}-[0-9]{2}", "", line, perl = TRUE)
+  after <- sub("^[ ,;:.-]*(?:as|for|at)\\b[[:space:]]*", "", after, perl = TRUE)
+  after <- sub("^[ ,;:.-]*(?:as|for|at)\\b[[:space:]]*", "", after, perl = TRUE)
+  after <- sub("[ .]+$", "", gsub("[[:space:]]+", " ", trimws(after)))
+  if (nzchar(after)) after else NA_character_
+}
+
 #' Parse a DCF field value (X-CRAN-History or X-CRAN-Comment) into an ordered list
 #' of events, each list(action, date, reason). read.dcf keeps each event on its own
 #' line, so we split on newlines: a verb-led line (or a "Versions ... removed" line)
 #' starts a new event; other lines are continuation reason for the current event;
 #' "." marker lines and blanks are dropped. The date is the first ISO date on the
-#' event line (NA when undated). Reason is cleaned via clean_comment_reason().
+#' event line (NA when undated); the reason is the cause via event_reason() (NA when
+#' a dated event carries no cause, e.g. an unarchival).
 parse_event_lines <- function(field) {
   if (is.null(field) || length(field) == 0L || is.na(field) || !nzchar(field)) return(list())
   lines <- trimws(strsplit(field, "\n", fixed = TRUE)[[1L]])
@@ -653,7 +671,7 @@ parse_event_lines <- function(field) {
       if (!is.null(cur)) events <- c(events, list(cur))
       d <- regmatches(ln, regexpr("[0-9]{4}-[0-9]{2}-[0-9]{2}", ln))
       d <- if (length(d)) d[1L] else NA_character_
-      cur <- list(action = action, date = d, reason = clean_comment_reason(ln))
+      cur <- list(action = action, date = d, reason = event_reason(ln, d))
     } else if (!is.null(cur)) {
       extra <- sub("[.[:space:]]+$", "", trimws(ln))
       cur$reason <- if (is.null(cur$reason) || is.na(cur$reason) || !nzchar(cur$reason)) extra
