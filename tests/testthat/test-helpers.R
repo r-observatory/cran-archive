@@ -328,7 +328,7 @@ test_that("parse_packages_in returns a named character vector (not a list)", {
 # build_archive integration: reasons from parse_packages_in
 # ---------------------------------------------------------------------------
 
-test_that("build_archive integration: removal_reason populated from parse_packages_in result", {
+test_that("build_archive integration: removal_reason populated (and cleaned) from parse_packages_in result", {
   # Use the fixture reasons map; build an archive_list that includes epoxy.
   reasons <- parse_packages_in(.PACKAGES_IN_FIXTURE)
   archive_list <- list(
@@ -336,10 +336,13 @@ test_that("build_archive integration: removal_reason populated from parse_packag
                              c("2024-01-01", "2026-07-02"))
   )
   out <- build_archive(archive_list, character(0), reasons)
+  # The stored reason is the cause only; the "Archived on <date> as" prefix is
+  # stripped (the date is surfaced separately via archived_on).
   expect_equal(
     out$removal_reason[out$package == "epoxy"],
-    "Archived on 2026-07-02 as issues were not corrected in time."
+    "issues were not corrected in time"
   )
+  expect_equal(out$archived_on[out$package == "epoxy"], "2026-07-02")
 })
 
 test_that("build_archive integration: removal_reason is NA for package absent from parse_packages_in result", {
@@ -515,4 +518,41 @@ test_that("build_archive: falls back to the max tarball mtime when the comment h
   reasons <- c(nodate = "Orphaned; maintainer unreachable.")
   adf <- build_archive(al, current_pkgs = character(0), reasons = reasons)
   expect_equal(adf$archived_on[adf$package == "nodate"], "2018-03-03")
+})
+
+# ---------------------------------------------------------------------------
+# clean_comment_reason strips the "<verb> on <date> [connector]" prefix
+# ---------------------------------------------------------------------------
+
+test_that("clean_comment_reason strips the leading status/date prefix + connector", {
+  expect_equal(clean_comment_reason("Archived on 2026-07-10 as email to the maintainer is undeliverable."),
+               "email to the maintainer is undeliverable")
+  expect_equal(clean_comment_reason("Removed on 2024-11-25 for misrepresentation of authorship."),
+               "misrepresentation of authorship")
+  expect_equal(clean_comment_reason("Removed on 2025-09-04 at the maintainer's request."),
+               "the maintainer's request")
+  expect_true(is.na(clean_comment_reason(NA_character_)))
+  expect_true(is.na(clean_comment_reason("")))
+})
+
+test_that("clean_comment_reason keeps a dateless comment as-is", {
+  expect_equal(clean_comment_reason("Orphaned; maintainer unreachable"),
+               "Orphaned; maintainer unreachable")
+})
+
+test_that("build_archive stores the cleaned reason alongside the comment date", {
+  al <- list(tmcn = .make_archive_df("tmcn", c("0.1", "0.2-13"), c("2015-01-01", "2019-08-08")))
+  reasons <- c(tmcn = "Archived on 2026-07-10 as email to the maintainer is undeliverable.")
+  adf <- build_archive(al, current_pkgs = character(0), reasons = reasons)
+  expect_equal(adf$archived_on[adf$package == "tmcn"], "2026-07-10")
+  expect_equal(adf$removal_reason[adf$package == "tmcn"], "email to the maintainer is undeliverable")
+})
+
+test_that("parse_history_episodes: strips for/at connectors in the reason, not only 'as'", {
+  eps <- parse_history_episodes(
+    "Archived on 2021-12-31 for repeated policy violation. Unarchived on 2022-02-01.")
+  expect_equal(eps[[1]]$removal_reason, "repeated policy violation")
+  eps2 <- parse_history_episodes(
+    "Archived on 2020-05-05 at the maintainer's request. Unarchived on 2020-06-06.")
+  expect_equal(eps2[[1]]$removal_reason, "the maintainer's request")
 })

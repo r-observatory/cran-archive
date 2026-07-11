@@ -1,17 +1,38 @@
 # cran-archive
 
 This pipeline records CRAN packages that have been removed from the live CRAN
-listing (archived), together with accurate dates. The live CRAN package index
-does not retain removed packages, so this fills that gap using CRAN's own
-archive.
+listing (archived), together with accurate dates and reasons. The live CRAN
+package index does not retain removed packages, so this fills that gap using
+CRAN's own archive.
 
-It reads CRAN's archive index (`src/contrib/Meta/archive.rds`) and the current
-list of available packages. A package is treated as archived when it appears in
-the archive but is no longer available on CRAN. For each archived package it
-records when it first appeared, when it was archived (the date of its last
-archived version), and that last version. The aggregated data is written to a
-SQLite database and published to the `r-observatory/cran-archive` GitHub
-repository for downstream consumers.
+It reads CRAN's archive index (`src/contrib/Meta/archive.rds`), the current list
+of available packages, and CRAN's `PACKAGES.in` annotations. A package is treated
+as archived when it appears in the archive but is no longer available on CRAN.
+For each archived package it records when it first appeared, when and why it was
+archived, and its last version. The aggregated data is written to a SQLite
+database and published to the `r-observatory/cran-archive` GitHub repository for
+downstream consumers.
+
+## Archived packages
+
+The archived tarballs only carry their original release dates, so the mtime of a
+package's last tarball is its last *release* date — which can predate the actual
+archival by years (a stable package archived only when its maintainer's email
+became undeliverable, say). The archival **date** and **reason** therefore come
+from CRAN's `X-CRAN-Comment` annotation, e.g.
+
+```
+X-CRAN-Comment: Archived on 2026-07-10 as email to the maintainer is undeliverable.
+```
+
+`archived_on` is the date parsed from that comment (falling back to the last
+tarball mtime only when the comment carries no date), and `removal_reason` is the
+cause with the leading `Archived on <date> as` prefix stripped.
+
+A package can be archived, restored, and archived again. CRAN records these
+cycles in `X-CRAN-History`, which persists even after a package returns to CRAN,
+so `cran_archive_history` retains each archival and re-listing (with its date and
+reason) as durable history rather than only the current state.
 
 ## Output
 
@@ -22,6 +43,10 @@ repository for downstream consumers.
   `updated_at`.
 - `cran_archive_events` - the per-version release timeline plus an archival
   marker for each package: `package`, `event_date`, `event_type`, `version`.
+- `cran_archive_history` - the durable archive/relist history: one row per
+  archival episode with `archived_on`, `removal_reason`, and `relisted_on`
+  (NULL while the package is currently archived), keyed by
+  `(package, episode_seq)`.
 
 A `manifest.json` accompanies the database and carries a `changed` flag so
 downstream consumers can skip unchanged rebuilds.
@@ -33,6 +58,3 @@ Rscript scripts/update.R out/            # incremental (change-gated)
 Rscript scripts/update.R out/ --bootstrap  # full rebuild
 Rscript tests/testthat.R                 # unit tests
 ```
-
-Removal reasons are not published by CRAN in a structured form; `removal_reason`
-is left empty until a curated source is available, rather than guessed.
