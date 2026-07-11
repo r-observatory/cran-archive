@@ -212,7 +212,7 @@ test_that("run_update: changed=TRUE on first run (no prior manifest)", {
   tmp <- withr::local_tempdir()
   out <- file.path(tmp, "out")
 
-  res <- run_update(make_stub_io(), out, force_full = FALSE)
+  res <- run_update(make_stub_io(), out, force_full = FALSE, min_current = 0L, min_archive = 0L)
   expect_true(res$changed)
 })
 
@@ -220,8 +220,8 @@ test_that("run_update: changed=FALSE on second run with identical input", {
   tmp <- withr::local_tempdir()
   out <- file.path(tmp, "out")
 
-  run_update(make_stub_io(), out, force_full = FALSE)
-  res2 <- run_update(make_stub_io(), out, force_full = FALSE)
+  run_update(make_stub_io(), out, force_full = FALSE, min_current = 0L, min_archive = 0L)
+  res2 <- run_update(make_stub_io(), out, force_full = FALSE, min_current = 0L, min_archive = 0L)
   expect_false(res2$changed)
 })
 
@@ -229,7 +229,7 @@ test_that("run_update: force_full=TRUE forces changed=TRUE even when fingerprint
   tmp <- withr::local_tempdir()
   out <- file.path(tmp, "out")
 
-  run_update(make_stub_io(), out, force_full = FALSE)
+  run_update(make_stub_io(), out, force_full = FALSE, min_current = 0L, min_archive = 0L)
   res2 <- run_update(make_stub_io(), out, force_full = TRUE)
   expect_true(res2$changed)
 })
@@ -239,14 +239,15 @@ test_that("run_update: changed=TRUE when archived set differs from prior manifes
   out <- file.path(tmp, "out")
 
   # First run with the fixture
-  run_update(make_stub_io(), out, force_full = FALSE)
+  run_update(make_stub_io(), out, force_full = FALSE, min_current = 0L, min_archive = 0L)
 
   # Second run with an extra archived package
   extra_archive <- c(
     FIXTURE_ARCHIVE,
     list(PkgNew = .make_adf("PkgNew", c("0.1"), c("2022-01-01")))
   )
-  res2 <- run_update(make_stub_io(archive = extra_archive), out, force_full = FALSE)
+  res2 <- run_update(make_stub_io(archive = extra_archive), out, force_full = FALSE,
+                     min_current = 0L, min_archive = 0L)
   expect_true(res2$changed)
 })
 
@@ -260,4 +261,21 @@ test_that("run_update: manifest.json on disk matches returned manifest", {
   expect_equal(from_disk$n_archived, res$manifest$n_archived)
   expect_equal(from_disk$source$archive_fingerprint,
                res$manifest$source$archive_fingerprint)
+})
+
+# ---------------------------------------------------------------------------
+# Fetch-sanity guard
+# ---------------------------------------------------------------------------
+
+test_that("run_update: aborts on an implausibly small current-packages fetch", {
+  tmp <- withr::local_tempdir(); out <- file.path(tmp, "out")
+  # current list of length 1 is far below the floor; a truncated fetch must abort.
+  expect_error(run_update(make_stub_io(current = c("PkgCurrent")), out, force_full = FALSE),
+               "current_packages")
+  expect_false(file.exists(file.path(out, "cran-archive.db")))
+})
+
+test_that("run_update: force_full bypasses the fetch-sanity floors", {
+  tmp <- withr::local_tempdir(); out <- file.path(tmp, "out")
+  expect_silent(run_update(make_stub_io(), out, force_full = TRUE))
 })

@@ -44,7 +44,10 @@ iso <- function(t) format(t, "%Y-%m-%dT%H:%M:%SZ", tz = "UTC")
 # ---------------------------------------------------------------------------
 
 run_update <- function(io, out_dir, force_full = FALSE,
-                       live_floor = CRAN_LIVE_FLOOR, archive_floor = CRAN_ARCHIVE_FLOOR) {
+                       min_current = CURRENT_PKGS_FLOOR,
+                       min_archive = ARCHIVE_LIST_FLOOR,
+                       live_floor = CRAN_LIVE_FLOOR,
+                       archive_floor = CRAN_ARCHIVE_FLOOR) {
   dir.create(out_dir, showWarnings = FALSE, recursive = TRUE)
 
   # 1. Fetch data sources via injectable io
@@ -52,6 +55,18 @@ run_update <- function(io, out_dir, force_full = FALSE,
   current_pkgs <- io$current_packages()
   reasons      <- io$removal_reasons()
   history_map  <- io$removal_history()
+
+  # Fetch-sanity guard (skipped for an explicit bootstrap/force).
+  if (!isTRUE(force_full)) {
+    if (length(current_pkgs) < min_current) {
+      stop(sprintf("current_packages returned %d (< %d): presumed truncated fetch; aborting.",
+                   length(current_pkgs), min_current))
+    }
+    if (length(archive_list) < min_archive) {
+      stop(sprintf("archive_rds returned %d packages (< %d): presumed truncated fetch; aborting.",
+                   length(archive_list), min_archive))
+    }
+  }
 
   # 2. Build the archived-package table, event log, and durable episode history
   archive_df <- build_archive(archive_list, current_pkgs, reasons)
