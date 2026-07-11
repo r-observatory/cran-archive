@@ -350,3 +350,58 @@ test_that("build_archive integration: removal_reason is NA for package absent fr
   out <- build_archive(archive_list, character(0), reasons)
   expect_true(is.na(out$removal_reason[out$package == "orphan"]))
 })
+
+# ---------------------------------------------------------------------------
+# parse_history_episodes / parse_packages_history
+# ---------------------------------------------------------------------------
+
+test_that("parse_history_episodes: single closed cycle with reason", {
+  eps <- parse_history_episodes(
+    "Archived on 2016-01-30 as check problems were not corrected. Unarchived on 2016-03-01.")
+  expect_equal(length(eps), 1L)
+  expect_equal(eps[[1]]$archived_on, "2016-01-30")
+  expect_equal(eps[[1]]$relisted_on, "2016-03-01")
+  expect_equal(eps[[1]]$removal_reason, "check problems were not corrected")
+})
+
+test_that("parse_history_episodes: multiple cycles preserved in order", {
+  eps <- parse_history_episodes(paste(
+    "Archived on 2023-08-14 as issues were not corrected despite repeated reminders.",
+    "Unarchived on 2023-08-21.",
+    "Archived on 2025-12-11 as issues were not corrected in multiple re-submissions.",
+    "Unarchived on 2025-12-12."))
+  expect_equal(length(eps), 2L)
+  expect_equal(eps[[1]]$archived_on, "2023-08-14")
+  expect_equal(eps[[1]]$relisted_on, "2023-08-21")
+  expect_equal(eps[[2]]$archived_on, "2025-12-11")
+  expect_equal(eps[[2]]$relisted_on, "2025-12-12")
+})
+
+test_that("parse_history_episodes: NA input returns an empty list", {
+  expect_equal(length(parse_history_episodes(NA_character_)), 0L)
+})
+
+test_that("parse_history_episodes: undated / alternate-verb events are skipped", {
+  expect_equal(length(parse_history_episodes(
+    "Versions 1.0.6 to 1.1.2 were removed for licence violations.")), 0L)
+  expect_equal(length(parse_history_episodes(
+    "Orphaned on 2023-02-05 after the maintainer became inactive.")), 0L)
+})
+
+test_that("parse_packages_history: maps package -> episodes, folds continuation lines", {
+  text <- paste(
+    "Package: Foo",
+    "X-CRAN-Comment: Archived on 2026-01-01 as broken.",
+    "X-CRAN-History: Archived on 2020-01-01 as check errors",
+    "  were not corrected. Unarchived on 2020-02-01.",
+    "",
+    "Package: Bar",
+    "Maintainer: Someone",
+    sep = "\n")
+  m <- parse_packages_history(text)
+  expect_true("Foo" %in% names(m))
+  expect_false("Bar" %in% names(m))
+  expect_equal(m[["Foo"]][[1]]$archived_on, "2020-01-01")
+  expect_equal(m[["Foo"]][[1]]$relisted_on, "2020-02-01")
+  expect_equal(m[["Foo"]][[1]]$removal_reason, "check errors were not corrected")
+})

@@ -356,6 +356,81 @@ export_names_all <- function(con, names_df) {
   invisible(NULL)
 }
 
+#' Normalise a reason fragment: drop a leading "as ", trailing punctuation and
+#' collapse whitespace. Returns NA_character_ when nothing remains.
+clean_history_reason <- function(x) {
+  x <- trimws(x)
+  x <- sub("^as[[:space:]]+", "", x)
+  x <- sub("[.[:space:]]+$", "", x)
+  x <- gsub("[[:space:]]+", " ", x)
+  if (!nzchar(x)) NA_character_ else x
+}
+
+#' Parse a single X-CRAN-History string into closed/open archival episodes.
+#' Only dated "Archived on YYYY-MM-DD" / "Unarchived on YYYY-MM-DD" markers are
+#' recognised; other verbs (Orphaned/Removed) and undated events are ignored.
+#' An "Archived" opens an episode; the next "Unarchived" closes it.
+parse_history_episodes <- function(hist) {
+  if (is.null(hist) || is.na(hist) || !nzchar(hist)) return(list())
+  pat <- "(Archived|Unarchived) on ([0-9]{4}-[0-9]{2}-[0-9]{2})"
+  g <- gregexpr(pat, hist, perl = TRUE)[[1L]]
+  if (g[1L] == -1L) return(list())
+  starts <- as.integer(g); lens <- attr(g, "match.length")
+  markers <- lapply(seq_along(starts), function(i) {
+    s <- starts[i]; e <- s + lens[i] - 1L
+    txt  <- substr(hist, s, e)
+    kind <- sub(" on .*$", "", txt)
+    date <- sub("^.* on ", "", txt)
+    reason_end <- if (i < length(starts)) starts[i + 1L] - 1L else nchar(hist)
+    reason <- clean_history_reason(substr(hist, e + 1L, reason_end))
+    list(kind = kind, date = date, reason = reason)
+  })
+  episodes <- list(); open <- NULL
+  for (mk in markers) {
+    if (mk$kind == "Archived") {
+      if (!is.null(open)) episodes[[length(episodes) + 1L]] <- open
+      open <- list(archived_on = mk$date, removal_reason = mk$reason,
+                   relisted_on = NA_character_)
+    } else if (mk$kind == "Unarchived" && !is.null(open)) {
+      open$relisted_on <- mk$date
+      episodes[[length(episodes) + 1L]] <- open
+      open <- NULL
+    }
+  }
+  if (!is.null(open)) episodes[[length(episodes) + 1L]] <- open
+  episodes
+}
+
+#' Parse PACKAGES.in text into a named list: package -> list of episodes from its
+#' X-CRAN-History field. Mirrors parse_packages_in()'s record/continuation walk.
+parse_packages_history <- function(text) {
+  text <- gsub("\r\n", "\n", text); text <- gsub("\r", "\n", text)
+  records <- strsplit(text, "\n{2,}")[[1L]]
+  result <- list()
+  for (rec in records) {
+    lines <- strsplit(rec, "\n")[[1L]]
+    if (length(lines) == 0L) next
+    pkg <- NA_character_; hist_val <- NULL; in_hist <- FALSE
+    for (line in lines) {
+      if (grepl("^Package:", line)) {
+        pkg <- trimws(sub("^Package:\\s*", "", line)); in_hist <- FALSE
+      } else if (grepl("^X-CRAN-History:", line)) {
+        hist_val <- trimws(sub("^X-CRAN-History:\\s*", "", line)); in_hist <- TRUE
+      } else if (in_hist && grepl("^[ \t]", line)) {
+        cont <- trimws(line)
+        if (cont != ".") hist_val <- paste(hist_val, cont)
+      } else if (grepl("^[A-Za-z]", line)) {
+        in_hist <- FALSE
+      }
+    }
+    if (!is.na(pkg) && !is.null(hist_val) && nzchar(hist_val)) {
+      eps <- parse_history_episodes(hist_val)
+      if (length(eps) > 0L) result[[pkg]] <- eps
+    }
+  }
+  result
+}
+
 #' Default IO providers: real network fetchers for production use.
 #'
 #' Returns a named list of zero-argument functions:
