@@ -74,6 +74,7 @@ run_update <- function(io, out_dir, force_full = FALSE,
   archive_df <- build_archive(archive_list, current_pkgs, reasons)
   events_df  <- build_archive_events(archive_list, current_pkgs)
   history_df <- build_archive_history(archive_df, history_map)
+  lineage_df <- if (is.function(io$packages_dcf)) build_archive_lineage(io$packages_dcf()) else build_archive_lineage(NULL)
 
   # 3. Compute a stable fingerprint over the archived set: SHA-256 hash of the
   #    sorted "package:archived_on" pairs joined by commas. If the archived set
@@ -96,7 +97,7 @@ run_update <- function(io, out_dir, force_full = FALSE,
   # 5. Export database (always written, even when changed=FALSE, to ensure the
   #    DB is present and consistent with the current data).
   db_path <- file.path(out_dir, DB_FILENAME)
-  export_archive(db_path, archive_df, events_df, history_df)
+  export_archive(db_path, archive_df, events_df, history_df, lineage_df)
 
   # Append-only cran_names_all: union archive + live names, gated against a
   # partial fetch, folded into the prior published table.

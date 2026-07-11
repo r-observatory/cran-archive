@@ -34,6 +34,17 @@ cycles in `X-CRAN-History`, which persists even after a package returns to CRAN,
 so `cran_archive_history` retains each archival and re-listing (with its date and
 reason) as durable history rather than only the current state.
 
+Beyond the archive/relist cycle, CRAN's `X-CRAN-History` and `X-CRAN-Comment`
+annotations describe a wider set of events: a package may be orphaned, have
+individual versions removed, be renamed, or be replaced by a successor. These
+are parsed into `cran_archive_lineage`, an ordered per-package timeline where
+each row is one event with its date (when stated), a canonical action, and the
+cleaned reason. The recognised actions are `archived`, `unarchived` (covering
+unarchival, unorphaning, restoration and reinstatement), `orphaned`, `removed`,
+`renamed`, and `replaced`. A `Replaced_by` annotation is folded in as a trailing
+`replaced` event. `cran_archive_action_counts` is a small companion histogram of
+how many events of each action occur across all packages.
+
 ## Output
 
 `cran-archive.db` (published on the rolling `current` release) contains:
@@ -47,6 +58,13 @@ reason) as durable history rather than only the current state.
   archival episode with `archived_on`, `removal_reason`, and `relisted_on`
   (NULL while the package is currently archived), keyed by
   `(package, episode_seq)`.
+- `cran_archive_lineage` - the full ordered event lineage parsed from the CRAN
+  annotations: one row per event with `package`, `seq` (position within the
+  package's timeline), `event_date` (NULL when the event is undated), `action`
+  (one of `archived`, `unarchived`, `orphaned`, `removed`, `renamed`,
+  `replaced`), and `reason`, keyed by `(package, seq)`.
+- `cran_archive_action_counts` - a histogram of the lineage: one row per
+  `action` with its total count `n` across all packages.
 
 A `manifest.json` accompanies the database and carries a `changed` flag so
 downstream consumers can skip unchanged rebuilds.
