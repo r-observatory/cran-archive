@@ -132,10 +132,13 @@ build_archive_events <- function(archive_list, current_pkgs) {
 
 #' Export the assembled archive tables to a fresh SQLite database.
 #'
-#' Creates (or replaces) the file at path with two tables:
-#'   cran_archive        -- one row per archived package (7 columns)
-#'   cran_archive_events -- one row per release/archived event (4 columns)
-#' and an index on cran_archive_events(package).
+#' Creates (or replaces) the file at path with three tables:
+#'   cran_archive         -- one row per archived package (7 columns)
+#'   cran_archive_events  -- one row per release/archived event (4 columns)
+#'   cran_archive_history -- one row per archival episode (closed + at most one
+#'                            open per package), with a partial unique index
+#'                            enforcing at most one open episode per package.
+#' and indexes on cran_archive_events(package) and cran_archive_history.
 #'
 #' @param path       File path for the output .db file.
 #' @param archive_df data.frame with columns (package, first_release,
@@ -143,7 +146,11 @@ build_archive_events <- function(archive_list, current_pkgs) {
 #'   source and updated_at columns are added automatically.
 #' @param events_df  data.frame with columns (package, event_date, event_type,
 #'   version) as returned by build_archive_events().
-export_archive <- function(path, archive_df, events_df) {
+#' @param history_df data.frame with columns (package, episode_seq,
+#'   archived_on, relisted_on, removal_reason, last_version, relist_source,
+#'   archived_on_source) as returned by build_archive_history(). source and
+#'   updated_at columns are added automatically.
+export_archive <- function(path, archive_df, events_df, history_df) {
   if (file.exists(path)) unlink(path)
   con <- RSQLite::dbConnect(RSQLite::SQLite(), path)
   on.exit(RSQLite::dbDisconnect(con), add = TRUE)
@@ -172,6 +179,29 @@ export_archive <- function(path, archive_df, events_df) {
   RSQLite::dbExecute(con,
     "CREATE INDEX idx_cran_archive_events_pkg ON cran_archive_events(package)")
 
+  RSQLite::dbExecute(con, "
+    CREATE TABLE cran_archive_history (
+      package            TEXT NOT NULL,
+      episode_seq        INTEGER NOT NULL,
+      archived_on        TEXT NOT NULL,
+      relisted_on        TEXT,
+      removal_reason     TEXT,
+      last_version       TEXT,
+      relist_source      TEXT,
+      archived_on_source TEXT,
+      source             TEXT NOT NULL DEFAULT 'cran-archive-rds',
+      updated_at         TEXT NOT NULL,
+      PRIMARY KEY (package, episode_seq),
+      CHECK (relisted_on IS NULL OR relisted_on >= archived_on)
+    )
+  ")
+  RSQLite::dbExecute(con,
+    "CREATE UNIQUE INDEX ux_cran_archive_history_open ON cran_archive_history(package) WHERE relisted_on IS NULL")
+  RSQLite::dbExecute(con,
+    "CREATE INDEX idx_cran_archive_history_pkg ON cran_archive_history(package)")
+  RSQLite::dbExecute(con,
+    "CREATE INDEX idx_cran_archive_history_relisted ON cran_archive_history(relisted_on) WHERE relisted_on IS NOT NULL")
+
   # Augment archive_df with source and updated_at before writing.
   # Use rep_len to safely handle the zero-row case.
   now      <- format(Sys.time(), "%Y-%m-%dT%H:%M:%SZ", tz = "UTC")
@@ -185,6 +215,14 @@ export_archive <- function(path, archive_df, events_df) {
 
   RSQLite::dbWriteTable(con, "cran_archive",        write_df,  append = TRUE)
   RSQLite::dbWriteTable(con, "cran_archive_events", events_df, append = TRUE)
+
+  hist_w <- history_df
+  hist_w$source     <- rep_len("cran-archive-rds", nrow(hist_w))
+  hist_w$updated_at <- rep_len(now, nrow(hist_w))
+  hist_w <- hist_w[, c("package","episode_seq","archived_on","relisted_on","removal_reason",
+                       "last_version","relist_source","archived_on_source","source","updated_at"),
+                   drop = FALSE]
+  RSQLite::dbWriteTable(con, "cran_archive_history", hist_w, append = TRUE)
 
   RSQLite::dbExecute(con, "VACUUM")
   invisible(NULL)
@@ -491,21 +529,25 @@ build_archive_history <- function(archive_df, history_map = list()) {
 #'   current_packages() -- returns a character vector of currently-available packages.
 #'   removal_reasons()  -- fetches PACKAGES.in and returns a named character vector
 #'                         mapping package name -> X-CRAN-Comment value.
+#'   removal_history()  -- fetches PACKAGES.in (cached with removal_reasons() in the
+#'                         same call) and returns a named list of X-CRAN-History
+#'                         episodes, package -> list of episodes.
+#'   prev_names()       -- downloads the prior published database and returns its
+#'                         cran_names_all table (0-row on a genuine cold start;
+#'                         throws when the prior release is unreachable).
 default_io <- function() {
+  .pin <- NULL
+  packages_in <- function() {
+    if (is.null(.pin)) {
+      .pin <<- paste(readLines(url(CRAN_PACKAGES_IN_URL), warn = FALSE), collapse = "\n")
+    }
+    .pin
+  }
   list(
-    archive_rds = function() {
-      readRDS(url(CRAN_ARCHIVE_URL))
-    },
-
-    current_packages = function() {
-      rownames(available.packages(repos = CRAN_PACKAGES_URL))
-    },
-
-    removal_reasons = function() {
-      parse_packages_in(
-        paste(readLines(url(CRAN_PACKAGES_IN_URL), warn = FALSE), collapse = "\n")
-      )
-    },
+    archive_rds      = function() readRDS(url(CRAN_ARCHIVE_URL)),
+    current_packages = function() rownames(available.packages(repos = CRAN_PACKAGES_URL)),
+    removal_reasons  = function() parse_packages_in(packages_in()),
+    removal_history  = function() parse_packages_history(packages_in()),
 
     prev_names = function() {
       empty <- data.frame(name_lower = character(0), canonical_name = character(0),

@@ -40,11 +40,13 @@ FIXTURE_CURRENT_PKGS <- c("PkgCurrent")
 
 make_stub_io <- function(archive = FIXTURE_ARCHIVE,
                          current = FIXTURE_CURRENT_PKGS,
-                         reasons = character(0)) {
+                         reasons = character(0),
+                         history = list()) {
   list(
     archive_rds      = function() archive,
     current_packages = function() current,
-    removal_reasons  = function() reasons
+    removal_reasons  = function() reasons,
+    removal_history  = function() history
   )
 }
 
@@ -149,6 +151,34 @@ test_that("run_update: removal_reason is NA when package absent from reasons map
   row <- RSQLite::dbGetQuery(con,
     "SELECT removal_reason FROM cran_archive WHERE package = 'PkgSingle'")
   expect_true(is.na(row$removal_reason))
+})
+
+# ---------------------------------------------------------------------------
+# cran_archive_history
+# ---------------------------------------------------------------------------
+
+test_that("run_update: cran_archive_history has one open episode per archived pkg", {
+  tmp <- withr::local_tempdir(); out <- file.path(tmp, "out")
+  run_update(make_stub_io(), out, force_full = TRUE)
+  con <- RSQLite::dbConnect(RSQLite::SQLite(), file.path(out, "cran-archive.db"))
+  on.exit(RSQLite::dbDisconnect(con), add = TRUE)
+  open <- RSQLite::dbGetQuery(con,
+    "SELECT package FROM cran_archive_history WHERE relisted_on IS NULL ORDER BY package")
+  expect_equal(open$package, c("PkgArchived", "PkgSingle"))
+})
+
+test_that("run_update: cran_archive_history records closed cycles from history map", {
+  tmp <- withr::local_tempdir(); out <- file.path(tmp, "out")
+  hist <- list(PkgArchived = list(
+    list(archived_on = "2018-01-01", removal_reason = "old", relisted_on = "2018-02-01")))
+  run_update(make_stub_io(history = hist), out, force_full = TRUE)
+  con <- RSQLite::dbConnect(RSQLite::SQLite(), file.path(out, "cran-archive.db"))
+  on.exit(RSQLite::dbDisconnect(con), add = TRUE)
+  rows <- RSQLite::dbGetQuery(con,
+    "SELECT episode_seq, archived_on, relisted_on FROM cran_archive_history
+     WHERE package='PkgArchived' ORDER BY episode_seq")
+  expect_equal(nrow(rows), 2L)                    # one closed (2018) + one open (2019)
+  expect_equal(rows$relisted_on, c("2018-02-01", NA_character_))
 })
 
 # ---------------------------------------------------------------------------

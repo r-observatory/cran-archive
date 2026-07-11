@@ -51,10 +51,12 @@ run_update <- function(io, out_dir, force_full = FALSE,
   archive_list <- io$archive_rds()
   current_pkgs <- io$current_packages()
   reasons      <- io$removal_reasons()
+  history_map  <- io$removal_history()
 
-  # 2. Build the archived-package table and the event log
+  # 2. Build the archived-package table, event log, and durable episode history
   archive_df <- build_archive(archive_list, current_pkgs, reasons)
   events_df  <- build_archive_events(archive_list, current_pkgs)
+  history_df <- build_archive_history(archive_df, history_map)
 
   # 3. Compute a stable fingerprint over the archived set: SHA-256 hash of the
   #    sorted "package:archived_on" pairs joined by commas. If the archived set
@@ -77,7 +79,7 @@ run_update <- function(io, out_dir, force_full = FALSE,
   # 5. Export database (always written, even when changed=FALSE, to ensure the
   #    DB is present and consistent with the current data).
   db_path <- file.path(out_dir, DB_FILENAME)
-  export_archive(db_path, archive_df, events_df)
+  export_archive(db_path, archive_df, events_df, history_df)
 
   # Append-only cran_names_all: union archive + live names, gated against a
   # partial fetch, folded into the prior published table.
