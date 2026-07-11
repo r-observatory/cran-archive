@@ -481,6 +481,7 @@ build_archive_history <- function(archive_df, history_map = list()) {
 
   open_map <- list()
   if (nrow(archive_df) > 0L) for (i in seq_len(nrow(archive_df))) {
+    if (is.na(archive_df$archived_on[i])) next
     p <- archive_df$package[i]
     open_map[[p]] <- list(archived_on = archive_df$archived_on[i], relisted_on = NA_character_,
       removal_reason = archive_df$removal_reason[i], last_version = archive_df$last_version[i],

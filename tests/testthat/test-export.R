@@ -208,6 +208,21 @@ test_that("export_archive: the open-episode unique index rejects two open rows",
   expect_error(export_archive(db, adf, edf, bad))
 })
 
+test_that("export_archive creates the cran_archive_history indexes", {
+  tmp <- withr::local_tempdir(); db <- file.path(tmp, "idx.db")
+  adf <- data.frame(package=character(0), first_release=character(0), archived_on=character(0),
+    last_version=character(0), removal_reason=character(0), stringsAsFactors=FALSE)
+  edf <- data.frame(package=character(0), event_date=character(0), event_type=character(0),
+    version=character(0), stringsAsFactors=FALSE)
+  hdf <- .make_empty_history_df()
+  export_archive(db, adf, edf, hdf)
+  con <- RSQLite::dbConnect(RSQLite::SQLite(), db); on.exit(RSQLite::dbDisconnect(con), add = TRUE)
+  idx <- RSQLite::dbGetQuery(con,
+    "SELECT name FROM sqlite_master WHERE type='index' AND tbl_name='cran_archive_history'")
+  expect_true(all(c("ux_cran_archive_history_open","idx_cran_archive_history_pkg",
+                    "idx_cran_archive_history_relisted") %in% idx$name))
+})
+
 # ---------------------------------------------------------------------------
 # write_manifest
 # ---------------------------------------------------------------------------

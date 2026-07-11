@@ -6,7 +6,9 @@
 # CRAN listing), and writes a SQLite catalog plus a JSON manifest to out_dir.
 #
 # run_update(io, out_dir, force_full) takes an injectable io for offline testing.
-# default_io() (in helpers.R) supplies the real network fetchers.
+# default_io() (in helpers.R) supplies the real network fetchers. min_current and
+# min_archive set the fetch-sanity floor below which a fetch is presumed truncated
+# and run_update() aborts rather than overwriting good data.
 #
 # Usage:
 #   Rscript scripts/update.R [out_dir] [--bootstrap]
@@ -54,7 +56,7 @@ run_update <- function(io, out_dir, force_full = FALSE,
   archive_list <- io$archive_rds()
   current_pkgs <- io$current_packages()
   reasons      <- io$removal_reasons()
-  history_map  <- io$removal_history()
+  history_map  <- if (is.function(io$removal_history)) io$removal_history() else list()
 
   # Fetch-sanity guard (skipped for an explicit bootstrap/force).
   if (!isTRUE(force_full)) {

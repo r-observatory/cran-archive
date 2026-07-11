@@ -466,3 +466,25 @@ test_that("build_archive_history: empty inputs -> zero-row frame with correct co
   expect_true(all(c("package","episode_seq","archived_on","relisted_on","removal_reason",
     "last_version","relist_source","archived_on_source") %in% names(h)))
 })
+
+test_that("build_archive_history: an archive_df row with NA archived_on yields no open episode and no error", {
+  adf <- data.frame(package="P", first_release="2015-01-01", archived_on=NA_character_,
+    last_version="1.0", removal_reason="x", stringsAsFactors=FALSE)
+  expect_equal(nrow(build_archive_history(adf, list())), 0L)
+})
+
+test_that("build_archive_history is deterministic across repeated calls", {
+  adf <- data.frame(package="P", first_release="2015-01-01", archived_on="2026-01-01",
+    last_version="1.0", removal_reason="x", stringsAsFactors=FALSE)
+  hm <- list(P = list(list(archived_on="2020-01-01", removal_reason="y", relisted_on="2020-02-01")))
+  expect_identical(build_archive_history(adf, hm), build_archive_history(adf, hm))
+})
+
+test_that("build_archive_history: closed episode colliding with the open archived_on is dropped", {
+  adf <- data.frame(package="P", first_release="2015-01-01", archived_on="2026-07-01",
+    last_version="2.0", removal_reason="now", stringsAsFactors=FALSE)
+  hm <- list(P = list(list(archived_on="2026-07-01", removal_reason="dup", relisted_on="2026-07-05")))
+  h <- build_archive_history(adf, hm)
+  expect_equal(nrow(h), 1L)          # only the open episode survives
+  expect_true(is.na(h$relisted_on))  # and it is the open one
+})

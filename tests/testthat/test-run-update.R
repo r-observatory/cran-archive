@@ -38,15 +38,23 @@ FIXTURE_ARCHIVE <- list(
 )
 FIXTURE_CURRENT_PKGS <- c("PkgCurrent")
 
+.empty_names_df <- function() {
+  data.frame(name_lower = character(0), canonical_name = character(0),
+             identity_state = character(0), first_seen = character(0),
+             last_seen = character(0), stringsAsFactors = FALSE)
+}
+
 make_stub_io <- function(archive = FIXTURE_ARCHIVE,
                          current = FIXTURE_CURRENT_PKGS,
                          reasons = character(0),
-                         history = list()) {
+                         history = list(),
+                         prev_names = .empty_names_df()) {
   list(
     archive_rds      = function() archive,
     current_packages = function() current,
     removal_reasons  = function() reasons,
-    removal_history  = function() history
+    removal_history  = function() history,
+    prev_names       = function() prev_names
   )
 }
 
