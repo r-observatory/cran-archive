@@ -32,6 +32,29 @@ comment_archived_on <- function(comment) {
   if (length(m) == 0L || !nzchar(m[1L])) NA_character_ else m[1L]
 }
 
+#' Strip the leading "<verb> on <date>" status prefix (and its connector) from an
+#' X-CRAN-Comment, leaving just the cause: "Archived on 2026-07-10 as email ..."
+#' becomes "email ...". The date is surfaced separately via comment_archived_on(),
+#' so it need not be repeated in the reason. Returns the trimmed comment unchanged
+#' when there is no date to strip, and NA_character_ for an absent comment.
+#'
+#' @param comment A single X-CRAN-Comment string (or NA).
+clean_comment_reason <- function(comment) {
+  if (is.null(comment) || length(comment) == 0L || is.na(comment) || !nzchar(comment)) {
+    return(NA_character_)
+  }
+  # Drop everything up to and including the first ISO date, then a leading
+  # connector word ("as"/"for"/"at"). Applied twice to catch a stray connector
+  # left when the first date is not the leading status date.
+  after <- sub("^.*?[0-9]{4}-[0-9]{2}-[0-9]{2}", "", comment, perl = TRUE)
+  if (!nzchar(trimws(after))) after <- comment
+  after <- sub("^[ ,;:.-]*(?:as|for|at)\\b[[:space:]]*", "", after, perl = TRUE)
+  after <- sub("^[ ,;:.-]*(?:as|for|at)\\b[[:space:]]*", "", after, perl = TRUE)
+  after <- gsub("[[:space:]]+", " ", trimws(after))
+  after <- sub("[ .]+$", "", after)
+  if (nzchar(after)) after else trimws(comment)
+}
+
 #' Build a data.frame of currently-archived CRAN packages.
 #'
 #' A package is considered currently archived if it appears in archive_list but
@@ -69,14 +92,17 @@ build_archive <- function(archive_list, current_pkgs, reasons = character(0)) {
     first_release  <- format(as.Date(mt[min_idx]), "%Y-%m-%d")
     last_path      <- rownames(df)[max_idx]
     last_version   <- parse_archive_version(last_path, pkg)
-    removal_reason <- if (pkg %in% names(reasons)) unname(reasons[pkg]) else NA_character_
+    raw_reason     <- if (pkg %in% names(reasons)) unname(reasons[pkg]) else NA_character_
     # The max tarball mtime is only the LAST-RELEASE date, which can predate the
     # actual archival by years (a stable package archived when its maintainer's
     # email became undeliverable, say). CRAN records the true archival date in the
-    # X-CRAN-Comment ("Archived on YYYY-MM-DD ..."); prefer it, and fall back to
-    # the tarball mtime only when the comment carries no date.
-    archived_on    <- comment_archived_on(removal_reason) %||%
+    # X-CRAN-Comment ("Archived on YYYY-MM-DD as ..."); prefer it, and fall back to
+    # the tarball mtime only when the comment carries no date. The stored reason is
+    # the cause only, with that "Archived on <date> as" prefix stripped (the date
+    # is surfaced separately via archived_on).
+    archived_on    <- comment_archived_on(raw_reason) %||%
                         format(as.Date(mt[max_idx]), "%Y-%m-%d")
+    removal_reason <- clean_comment_reason(raw_reason)
     data.frame(
       package        = pkg,
       first_release  = first_release,
