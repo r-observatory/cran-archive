@@ -556,3 +556,128 @@ test_that("parse_history_episodes: strips for/at connectors in the reason, not o
     "Archived on 2020-05-05 at the maintainer's request. Unarchived on 2020-06-06.")
   expect_equal(eps2[[1]]$removal_reason, "the maintainer's request")
 })
+
+# ---------------------------------------------------------------------------
+# canon_action
+# ---------------------------------------------------------------------------
+
+test_that("canon_action: relist synonyms all fold to 'unarchived'", {
+  expect_equal(canon_action("Unarchived"), "unarchived")
+  expect_equal(canon_action("Unorphaned"), "unarchived")
+  expect_equal(canon_action("Restored"),   "unarchived")
+  expect_equal(canon_action("Reinstated"), "unarchived")
+})
+
+test_that("canon_action: each remaining verb maps to its own action", {
+  expect_equal(canon_action("Archived"),   "archived")
+  expect_equal(canon_action("Orphaned"),   "orphaned")
+  expect_equal(canon_action("Removed"),    "removed")
+  expect_equal(canon_action("Renamed"),    "renamed")
+  expect_equal(canon_action("Replaced"),   "replaced")
+  expect_equal(canon_action("Deprecated"), "deprecated")
+})
+
+test_that("canon_action: an unknown verb is NA", {
+  expect_true(is.na(canon_action("Wobbled")))
+})
+
+# ---------------------------------------------------------------------------
+# parse_event_lines
+# ---------------------------------------------------------------------------
+
+test_that("parse_event_lines: three dated events in order with cleaned reasons", {
+  ev <- parse_event_lines(paste(
+    "Orphaned on 2013-11-12 as the maintainer failed to respond.",
+    "Archived on 2017-12-18 as had new/delete mismatches.",
+    "Unarchived/Unorphaned on 2020-02-13.",
+    sep = "\n"))
+  expect_equal(length(ev), 3L)
+  expect_equal(vapply(ev, `[[`, character(1L), "action"),
+               c("orphaned", "archived", "unarchived"))
+  expect_equal(vapply(ev, `[[`, character(1L), "date"),
+               c("2013-11-12", "2017-12-18", "2020-02-13"))
+  expect_equal(ev[[1]]$reason, "the maintainer failed to respond")
+  expect_equal(ev[[2]]$reason, "had new/delete mismatches")
+})
+
+test_that("parse_event_lines: a continuation line folds into the current event reason", {
+  ev <- parse_event_lines(paste(
+    "Archived on 2018-02-27 as check problems were not corrected despite reminder.",
+    "Dangerous compilation flags.",
+    "Unarchived on 2018-03-03.",
+    sep = "\n"))
+  expect_equal(length(ev), 2L)
+  expect_equal(ev[[1]]$action, "archived")
+  expect_equal(ev[[1]]$date,   "2018-02-27")
+  expect_equal(ev[[1]]$reason,
+               "check problems were not corrected despite reminder Dangerous compilation flags")
+  expect_equal(ev[[2]]$action, "unarchived")
+  expect_equal(ev[[2]]$date,   "2018-03-03")
+})
+
+test_that("parse_event_lines: an undated 'Versions ... removed' line yields a removed event", {
+  ev <- parse_event_lines(
+    "Versions 0.30 and 0.32 were removed for copyright violations.")
+  expect_equal(length(ev), 1L)
+  expect_equal(ev[[1]]$action, "removed")
+  expect_true(is.na(ev[[1]]$date))
+})
+
+test_that("parse_event_lines: blank and '.' marker lines are dropped", {
+  ev <- parse_event_lines(paste(
+    "Archived on 2019-07-20 as installation errors were not corrected.",
+    ".",
+    "",
+    "Unarchived on 2019-09-24.",
+    sep = "\n"))
+  expect_equal(length(ev), 2L)
+  expect_equal(ev[[1]]$reason, "installation errors were not corrected")
+})
+
+test_that("parse_event_lines: empty / NA input returns an empty list", {
+  expect_equal(length(parse_event_lines(NA_character_)), 0L)
+  expect_equal(length(parse_event_lines("")), 0L)
+  expect_equal(length(parse_event_lines(NULL)), 0L)
+})
+
+# ---------------------------------------------------------------------------
+# build_archive_lineage
+# ---------------------------------------------------------------------------
+
+test_that("build_archive_lineage: history, comment, and Replaced_by compose in order", {
+  dcf <- read.dcf(textConnection(paste(
+    "Package: alpha",
+    "X-CRAN-History: Orphaned on 2013-11-12 as the maintainer failed to respond.",
+    "  Archived on 2017-12-18 as had new/delete mismatches.",
+    "  Unarchived/Unorphaned on 2020-02-13.",
+    "X-CRAN-Comment: Archived on 2020-02-14 as memory-access errors had not been corrected.",
+    "Replaced_by: beta",
+    "",
+    "Package: gamma",
+    "X-CRAN-Comment: Archived on 2024-01-05 as email bounced.",
+    sep = "\n")))
+  lin <- build_archive_lineage(dcf)
+
+  alpha <- lin[lin$package == "alpha", ]
+  expect_equal(alpha$seq, 1:5)
+  expect_equal(alpha$action,
+               c("orphaned", "archived", "unarchived", "archived", "replaced"))
+  expect_equal(alpha$event_date,
+               c("2013-11-12", "2017-12-18", "2020-02-13", "2020-02-14", NA))
+  expect_equal(alpha$reason[5], "replaced by beta")
+
+  gamma <- lin[lin$package == "gamma", ]
+  expect_equal(nrow(gamma), 1L)
+  expect_equal(gamma$action, "archived")
+  expect_equal(gamma$event_date, "2024-01-05")
+
+  # Ordered by package then seq.
+  expect_equal(lin$package, c(rep("alpha", 5L), "gamma"))
+})
+
+test_that("build_archive_lineage: NULL and empty inputs return the empty frame", {
+  empty <- build_archive_lineage(NULL)
+  expect_equal(nrow(empty), 0L)
+  expect_equal(colnames(empty), c("package", "seq", "event_date", "action", "reason"))
+  expect_equal(nrow(build_archive_lineage(read.dcf(textConnection("Maintainer: none\n")))), 0L)
+})

@@ -198,7 +198,10 @@ build_archive_events <- function(archive_list, current_pkgs) {
 #'   archived_on, relisted_on, removal_reason, last_version, relist_source,
 #'   archived_on_source) as returned by build_archive_history(). source and
 #'   updated_at columns are added automatically.
-export_archive <- function(path, archive_df, events_df, history_df) {
+#' @param lineage_df data.frame with columns (package, seq, event_date, action,
+#'   reason) as returned by build_archive_lineage(). Written to
+#'   cran_archive_lineage, with an action histogram in cran_archive_action_counts.
+export_archive <- function(path, archive_df, events_df, history_df, lineage_df) {
   if (file.exists(path)) unlink(path)
   con <- RSQLite::dbConnect(RSQLite::SQLite(), path)
   on.exit(RSQLite::dbDisconnect(con), add = TRUE)
@@ -271,6 +274,41 @@ export_archive <- function(path, archive_df, events_df, history_df) {
                        "last_version","relist_source","archived_on_source","source","updated_at"),
                    drop = FALSE]
   RSQLite::dbWriteTable(con, "cran_archive_history", hist_w, append = TRUE)
+
+  # Per-package ordered event lineage parsed from the PACKAGES.in annotations,
+  # plus a histogram of how often each action occurs across all packages.
+  RSQLite::dbExecute(con, "
+    CREATE TABLE cran_archive_lineage (
+      package    TEXT NOT NULL,
+      seq        INTEGER NOT NULL,
+      event_date TEXT,
+      action     TEXT NOT NULL,
+      reason     TEXT,
+      PRIMARY KEY (package, seq)
+    )
+  ")
+  RSQLite::dbExecute(con,
+    "CREATE INDEX idx_cran_archive_lineage_pkg ON cran_archive_lineage(package)")
+  RSQLite::dbExecute(con,
+    "CREATE INDEX idx_cran_archive_lineage_action ON cran_archive_lineage(action)")
+
+  RSQLite::dbExecute(con, "
+    CREATE TABLE cran_archive_action_counts (
+      action TEXT PRIMARY KEY,
+      n      INTEGER NOT NULL
+    )
+  ")
+
+  if (!is.null(lineage_df) && nrow(lineage_df) > 0L) {
+    lin_w <- lineage_df[, c("package", "seq", "event_date", "action", "reason"), drop = FALSE]
+    RSQLite::dbWriteTable(con, "cran_archive_lineage", lin_w, append = TRUE)
+
+    tab <- as.data.frame(table(lineage_df$action), stringsAsFactors = FALSE)
+    counts_df <- data.frame(action = tab[[1L]], n = as.integer(tab[[2L]]),
+                            stringsAsFactors = FALSE)
+    counts_df <- counts_df[order(counts_df$action), , drop = FALSE]
+    RSQLite::dbWriteTable(con, "cran_archive_action_counts", counts_df, append = TRUE)
+  }
 
   RSQLite::dbExecute(con, "VACUUM")
   invisible(NULL)
@@ -573,6 +611,98 @@ build_archive_history <- function(archive_df, history_map = list()) {
   out[order(out$package, out$episode_seq), , drop = FALSE]
 }
 
+#' Canonicalise a CRAN status verb to one of the six lineage actions.
+canon_action <- function(verb) {
+  v <- tolower(verb)
+  if (v %in% c("unarchived", "unorphaned", "restored", "reinstated")) "unarchived"
+  else if (v == "archived")   "archived"
+  else if (v == "orphaned")   "orphaned"
+  else if (v == "removed")    "removed"
+  else if (v == "renamed")    "renamed"
+  else if (v == "replaced")   "replaced"
+  else if (v == "deprecated") "deprecated"
+  else NA_character_
+}
+
+# Status verbs that begin an event line.
+.LINEAGE_VERBS <- c("Unarchived", "Unorphaned", "Archived", "Orphaned",
+                    "Removed", "Renamed", "Replaced", "Restored",
+                    "Reinstated", "Deprecated")
+
+#' Parse a DCF field value (X-CRAN-History or X-CRAN-Comment) into an ordered list
+#' of events, each list(action, date, reason). read.dcf keeps each event on its own
+#' line, so we split on newlines: a verb-led line (or a "Versions ... removed" line)
+#' starts a new event; other lines are continuation reason for the current event;
+#' "." marker lines and blanks are dropped. The date is the first ISO date on the
+#' event line (NA when undated). Reason is cleaned via clean_comment_reason().
+parse_event_lines <- function(field) {
+  if (is.null(field) || length(field) == 0L || is.na(field) || !nzchar(field)) return(list())
+  lines <- trimws(strsplit(field, "\n", fixed = TRUE)[[1L]])
+  lines <- lines[nzchar(lines) & lines != "."]
+  events <- list(); cur <- NULL
+  for (ln in lines) {
+    action <- NA_character_
+    for (v in .LINEAGE_VERBS) {
+      if (startsWith(ln, v)) {
+        nxt <- substr(ln, nchar(v) + 1L, nchar(v) + 1L)
+        if (!nzchar(nxt) || !grepl("[A-Za-z]", nxt)) { action <- canon_action(v); break }
+      }
+    }
+    if (is.na(action) && grepl("^Versions? .*removed", ln)) action <- "removed"
+    if (!is.na(action)) {
+      if (!is.null(cur)) events <- c(events, list(cur))
+      d <- regmatches(ln, regexpr("[0-9]{4}-[0-9]{2}-[0-9]{2}", ln))
+      d <- if (length(d)) d[1L] else NA_character_
+      cur <- list(action = action, date = d, reason = clean_comment_reason(ln))
+    } else if (!is.null(cur)) {
+      extra <- sub("[.[:space:]]+$", "", trimws(ln))
+      cur$reason <- if (is.null(cur$reason) || is.na(cur$reason) || !nzchar(cur$reason)) extra
+                    else paste(cur$reason, extra)
+    }
+  }
+  if (!is.null(cur)) events <- c(events, list(cur))
+  events
+}
+
+#' Build the per-package event lineage from a read.dcf() matrix of PACKAGES.in.
+#' For each package: the past events from X-CRAN-History (chronological), then the
+#' current open archival from X-CRAN-Comment, then a "replaced" event if a
+#' Replaced_by field is present. Returns data.frame(package, seq, event_date,
+#' action, reason) ordered by package then seq.
+build_archive_lineage <- function(dcf) {
+  empty <- data.frame(package = character(0), seq = integer(0), event_date = character(0),
+                      action = character(0), reason = character(0), stringsAsFactors = FALSE)
+  if (is.null(dcf) || nrow(dcf) == 0L || !"Package" %in% colnames(dcf)) return(empty)
+  cols <- colnames(dcf)
+  getf <- function(i, f) if (f %in% cols) dcf[i, f] else NA_character_
+  frames <- vector("list", nrow(dcf))
+  for (i in seq_len(nrow(dcf))) {
+    # Matrix indexing carries the column name onto the scalar; drop it so it does
+    # not surface as a discarded data.frame row name.
+    pkg <- unname(dcf[i, "Package"])
+    if (is.na(pkg) || !nzchar(pkg)) next
+    ev <- c(parse_event_lines(getf(i, "X-CRAN-History")),
+            parse_event_lines(getf(i, "X-CRAN-Comment")))
+    rb <- getf(i, "Replaced_by")
+    if (!is.na(rb) && nzchar(rb)) {
+      ev <- c(ev, list(list(action = "replaced", date = NA_character_,
+                            reason = paste0("replaced by ", trimws(rb)))))
+    }
+    if (length(ev) == 0L) next
+    frames[[i]] <- data.frame(
+      package    = pkg,
+      seq        = seq_along(ev),
+      event_date = vapply(ev, function(e) if (is.null(e$date) || is.na(e$date)) NA_character_ else e$date, character(1L)),
+      action     = vapply(ev, function(e) e$action, character(1L)),
+      reason     = vapply(ev, function(e) if (is.null(e$reason) || is.na(e$reason) || !nzchar(e$reason)) NA_character_ else e$reason, character(1L)),
+      stringsAsFactors = FALSE)
+  }
+  frames <- Filter(Negate(is.null), frames)
+  if (length(frames) == 0L) return(empty)
+  out <- do.call(rbind, frames); rownames(out) <- NULL
+  out[order(out$package, out$seq), , drop = FALSE]
+}
+
 #' Default IO providers: real network fetchers for production use.
 #'
 #' Returns a named list of zero-argument functions:
@@ -583,6 +713,8 @@ build_archive_history <- function(archive_df, history_map = list()) {
 #'   removal_history()  -- fetches PACKAGES.in (cached with removal_reasons() in the
 #'                         same call) and returns a named list of X-CRAN-History
 #'                         episodes, package -> list of episodes.
+#'   packages_dcf()     -- fetches PACKAGES.in (same cache) and returns it parsed as
+#'                         a read.dcf() character matrix for the event lineage.
 #'   prev_names()       -- downloads the prior published database and returns its
 #'                         cran_names_all table (0-row on a genuine cold start;
 #'                         throws when the prior release is unreachable).
@@ -599,6 +731,7 @@ default_io <- function() {
     current_packages = function() rownames(available.packages(repos = CRAN_PACKAGES_URL)),
     removal_reasons  = function() parse_packages_in(packages_in()),
     removal_history  = function() parse_packages_history(packages_in()),
+    packages_dcf     = function() read.dcf(textConnection(packages_in())),
 
     prev_names = function() {
       empty <- data.frame(name_lower = character(0), canonical_name = character(0),

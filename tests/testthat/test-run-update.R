@@ -44,17 +44,31 @@ FIXTURE_CURRENT_PKGS <- c("PkgCurrent")
              last_seen = character(0), stringsAsFactors = FALSE)
 }
 
+# A small read.dcf-shaped PACKAGES.in matrix for the lineage path.
+.stub_dcf <- function() {
+  read.dcf(textConnection(paste(
+    "Package: PkgArchived",
+    "X-CRAN-History: Archived on 2018-01-01 as checks failed.",
+    "  Unarchived on 2018-02-01.",
+    "",
+    "Package: PkgSingle",
+    "X-CRAN-Comment: Archived on 2013-07-21 as email bounced.",
+    sep = "\n")))
+}
+
 make_stub_io <- function(archive = FIXTURE_ARCHIVE,
                          current = FIXTURE_CURRENT_PKGS,
                          reasons = character(0),
                          history = list(),
-                         prev_names = .empty_names_df()) {
+                         prev_names = .empty_names_df(),
+                         packages_dcf = .stub_dcf()) {
   list(
     archive_rds      = function() archive,
     current_packages = function() current,
     removal_reasons  = function() reasons,
     removal_history  = function() history,
-    prev_names       = function() prev_names
+    prev_names       = function() prev_names,
+    packages_dcf     = function() packages_dcf
   )
 }
 
