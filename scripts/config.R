@@ -9,3 +9,9 @@ DB_FILENAME           <- "cran-archive.db"
 # the run reuses the prior published database rather than shrinking it.
 CRAN_LIVE_FLOOR    <- 15000L
 CRAN_ARCHIVE_FLOOR <- 20000L
+
+# Fetch-sanity floors: below these a fetch is presumed truncated and the run
+# aborts (no write) rather than publishing a shrunken catalog. The pipeline is a
+# stateless rebuild, so the next healthy run self-heals.
+CURRENT_PKGS_FLOOR  <- 15000L
+ARCHIVE_LIST_FLOOR  <- 5000L

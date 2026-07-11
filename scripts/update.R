@@ -6,7 +6,9 @@
 # CRAN listing), and writes a SQLite catalog plus a JSON manifest to out_dir.
 #
 # run_update(io, out_dir, force_full) takes an injectable io for offline testing.
-# default_io() (in helpers.R) supplies the real network fetchers.
+# default_io() (in helpers.R) supplies the real network fetchers. min_current and
+# min_archive set the fetch-sanity floor below which a fetch is presumed truncated
+# and run_update() aborts rather than overwriting good data.
 #
 # Usage:
 #   Rscript scripts/update.R [out_dir] [--bootstrap]
@@ -44,17 +46,34 @@ iso <- function(t) format(t, "%Y-%m-%dT%H:%M:%SZ", tz = "UTC")
 # ---------------------------------------------------------------------------
 
 run_update <- function(io, out_dir, force_full = FALSE,
-                       live_floor = CRAN_LIVE_FLOOR, archive_floor = CRAN_ARCHIVE_FLOOR) {
+                       min_current = CURRENT_PKGS_FLOOR,
+                       min_archive = ARCHIVE_LIST_FLOOR,
+                       live_floor = CRAN_LIVE_FLOOR,
+                       archive_floor = CRAN_ARCHIVE_FLOOR) {
   dir.create(out_dir, showWarnings = FALSE, recursive = TRUE)
 
   # 1. Fetch data sources via injectable io
   archive_list <- io$archive_rds()
   current_pkgs <- io$current_packages()
   reasons      <- io$removal_reasons()
+  history_map  <- if (is.function(io$removal_history)) io$removal_history() else list()
 
-  # 2. Build the archived-package table and the event log
+  # Fetch-sanity guard (skipped for an explicit bootstrap/force).
+  if (!isTRUE(force_full)) {
+    if (length(current_pkgs) < min_current) {
+      stop(sprintf("current_packages returned %d (< %d): presumed truncated fetch; aborting.",
+                   length(current_pkgs), min_current))
+    }
+    if (length(archive_list) < min_archive) {
+      stop(sprintf("archive_rds returned %d packages (< %d): presumed truncated fetch; aborting.",
+                   length(archive_list), min_archive))
+    }
+  }
+
+  # 2. Build the archived-package table, event log, and durable episode history
   archive_df <- build_archive(archive_list, current_pkgs, reasons)
   events_df  <- build_archive_events(archive_list, current_pkgs)
+  history_df <- build_archive_history(archive_df, history_map)
 
   # 3. Compute a stable fingerprint over the archived set: SHA-256 hash of the
   #    sorted "package:archived_on" pairs joined by commas. If the archived set
@@ -77,7 +96,7 @@ run_update <- function(io, out_dir, force_full = FALSE,
   # 5. Export database (always written, even when changed=FALSE, to ensure the
   #    DB is present and consistent with the current data).
   db_path <- file.path(out_dir, DB_FILENAME)
-  export_archive(db_path, archive_df, events_df)
+  export_archive(db_path, archive_df, events_df, history_df)
 
   # Append-only cran_names_all: union archive + live names, gated against a
   # partial fetch, folded into the prior published table.

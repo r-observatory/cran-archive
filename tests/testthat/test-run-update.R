@@ -38,13 +38,23 @@ FIXTURE_ARCHIVE <- list(
 )
 FIXTURE_CURRENT_PKGS <- c("PkgCurrent")
 
+.empty_names_df <- function() {
+  data.frame(name_lower = character(0), canonical_name = character(0),
+             identity_state = character(0), first_seen = character(0),
+             last_seen = character(0), stringsAsFactors = FALSE)
+}
+
 make_stub_io <- function(archive = FIXTURE_ARCHIVE,
                          current = FIXTURE_CURRENT_PKGS,
-                         reasons = character(0)) {
+                         reasons = character(0),
+                         history = list(),
+                         prev_names = .empty_names_df()) {
   list(
     archive_rds      = function() archive,
     current_packages = function() current,
-    removal_reasons  = function() reasons
+    removal_reasons  = function() reasons,
+    removal_history  = function() history,
+    prev_names       = function() prev_names
   )
 }
 
@@ -152,6 +162,34 @@ test_that("run_update: removal_reason is NA when package absent from reasons map
 })
 
 # ---------------------------------------------------------------------------
+# cran_archive_history
+# ---------------------------------------------------------------------------
+
+test_that("run_update: cran_archive_history has one open episode per archived pkg", {
+  tmp <- withr::local_tempdir(); out <- file.path(tmp, "out")
+  run_update(make_stub_io(), out, force_full = TRUE)
+  con <- RSQLite::dbConnect(RSQLite::SQLite(), file.path(out, "cran-archive.db"))
+  on.exit(RSQLite::dbDisconnect(con), add = TRUE)
+  open <- RSQLite::dbGetQuery(con,
+    "SELECT package FROM cran_archive_history WHERE relisted_on IS NULL ORDER BY package")
+  expect_equal(open$package, c("PkgArchived", "PkgSingle"))
+})
+
+test_that("run_update: cran_archive_history records closed cycles from history map", {
+  tmp <- withr::local_tempdir(); out <- file.path(tmp, "out")
+  hist <- list(PkgArchived = list(
+    list(archived_on = "2018-01-01", removal_reason = "old", relisted_on = "2018-02-01")))
+  run_update(make_stub_io(history = hist), out, force_full = TRUE)
+  con <- RSQLite::dbConnect(RSQLite::SQLite(), file.path(out, "cran-archive.db"))
+  on.exit(RSQLite::dbDisconnect(con), add = TRUE)
+  rows <- RSQLite::dbGetQuery(con,
+    "SELECT episode_seq, archived_on, relisted_on FROM cran_archive_history
+     WHERE package='PkgArchived' ORDER BY episode_seq")
+  expect_equal(nrow(rows), 2L)                    # one closed (2018) + one open (2019)
+  expect_equal(rows$relisted_on, c("2018-02-01", NA_character_))
+})
+
+# ---------------------------------------------------------------------------
 # Manifest
 # ---------------------------------------------------------------------------
 
@@ -182,7 +220,7 @@ test_that("run_update: changed=TRUE on first run (no prior manifest)", {
   tmp <- withr::local_tempdir()
   out <- file.path(tmp, "out")
 
-  res <- run_update(make_stub_io(), out, force_full = FALSE)
+  res <- run_update(make_stub_io(), out, force_full = FALSE, min_current = 0L, min_archive = 0L)
   expect_true(res$changed)
 })
 
@@ -190,8 +228,8 @@ test_that("run_update: changed=FALSE on second run with identical input", {
   tmp <- withr::local_tempdir()
   out <- file.path(tmp, "out")
 
-  run_update(make_stub_io(), out, force_full = FALSE)
-  res2 <- run_update(make_stub_io(), out, force_full = FALSE)
+  run_update(make_stub_io(), out, force_full = FALSE, min_current = 0L, min_archive = 0L)
+  res2 <- run_update(make_stub_io(), out, force_full = FALSE, min_current = 0L, min_archive = 0L)
   expect_false(res2$changed)
 })
 
@@ -199,7 +237,7 @@ test_that("run_update: force_full=TRUE forces changed=TRUE even when fingerprint
   tmp <- withr::local_tempdir()
   out <- file.path(tmp, "out")
 
-  run_update(make_stub_io(), out, force_full = FALSE)
+  run_update(make_stub_io(), out, force_full = FALSE, min_current = 0L, min_archive = 0L)
   res2 <- run_update(make_stub_io(), out, force_full = TRUE)
   expect_true(res2$changed)
 })
@@ -209,14 +247,15 @@ test_that("run_update: changed=TRUE when archived set differs from prior manifes
   out <- file.path(tmp, "out")
 
   # First run with the fixture
-  run_update(make_stub_io(), out, force_full = FALSE)
+  run_update(make_stub_io(), out, force_full = FALSE, min_current = 0L, min_archive = 0L)
 
   # Second run with an extra archived package
   extra_archive <- c(
     FIXTURE_ARCHIVE,
     list(PkgNew = .make_adf("PkgNew", c("0.1"), c("2022-01-01")))
   )
-  res2 <- run_update(make_stub_io(archive = extra_archive), out, force_full = FALSE)
+  res2 <- run_update(make_stub_io(archive = extra_archive), out, force_full = FALSE,
+                     min_current = 0L, min_archive = 0L)
   expect_true(res2$changed)
 })
 
@@ -230,4 +269,21 @@ test_that("run_update: manifest.json on disk matches returned manifest", {
   expect_equal(from_disk$n_archived, res$manifest$n_archived)
   expect_equal(from_disk$source$archive_fingerprint,
                res$manifest$source$archive_fingerprint)
+})
+
+# ---------------------------------------------------------------------------
+# Fetch-sanity guard
+# ---------------------------------------------------------------------------
+
+test_that("run_update: aborts on an implausibly small current-packages fetch", {
+  tmp <- withr::local_tempdir(); out <- file.path(tmp, "out")
+  # current list of length 1 is far below the floor; a truncated fetch must abort.
+  expect_error(run_update(make_stub_io(current = c("PkgCurrent")), out, force_full = FALSE),
+               "current_packages")
+  expect_false(file.exists(file.path(out, "cran-archive.db")))
+})
+
+test_that("run_update: force_full bypasses the fetch-sanity floors", {
+  tmp <- withr::local_tempdir(); out <- file.path(tmp, "out")
+  expect_silent(run_update(make_stub_io(), out, force_full = TRUE))
 })
