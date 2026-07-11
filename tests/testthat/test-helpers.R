@@ -405,3 +405,64 @@ test_that("parse_packages_history: maps package -> episodes, folds continuation 
   expect_equal(m[["Foo"]][[1]]$relisted_on, "2020-02-01")
   expect_equal(m[["Foo"]][[1]]$removal_reason, "check errors were not corrected")
 })
+
+# ---------------------------------------------------------------------------
+# build_archive_history
+# ---------------------------------------------------------------------------
+
+test_that("build_archive_history: open episode from archive_df has NA relisted_on", {
+  adf <- data.frame(package="PkgOpen", first_release="2015-01-01",
+    archived_on="2026-07-01", last_version="1.2", removal_reason="broken",
+    stringsAsFactors=FALSE)
+  h <- build_archive_history(adf, list())
+  expect_equal(nrow(h), 1L)
+  expect_equal(h$episode_seq, 1L)
+  expect_true(is.na(h$relisted_on))
+  expect_equal(h$archived_on_source, "archive-rds")
+})
+
+test_that("build_archive_history: closed episodes from history, ordered, seq assigned", {
+  adf <- data.frame(package=character(0), first_release=character(0),
+    archived_on=character(0), last_version=character(0), removal_reason=character(0),
+    stringsAsFactors=FALSE)
+  hm <- list(Cyc = list(
+    list(archived_on="2025-12-11", removal_reason="second", relisted_on="2025-12-12"),
+    list(archived_on="2023-08-14", removal_reason="first",  relisted_on="2023-08-21")))
+  h <- build_archive_history(adf, hm)
+  expect_equal(nrow(h), 2L)
+  expect_equal(h$archived_on, c("2023-08-14", "2025-12-11"))  # sorted ascending
+  expect_equal(h$episode_seq, c(1L, 2L))
+  expect_equal(h$relist_source, c("x-cran-history", "x-cran-history"))
+})
+
+test_that("build_archive_history: currently-archived package keeps closed history + open", {
+  adf <- data.frame(package="Both", first_release="2015-01-01",
+    archived_on="2026-07-01", last_version="3.0", removal_reason="now",
+    stringsAsFactors=FALSE)
+  hm <- list(Both = list(
+    list(archived_on="2020-01-01", removal_reason="then", relisted_on="2020-02-01")))
+  h <- build_archive_history(adf, hm)
+  expect_equal(nrow(h), 2L)
+  expect_equal(h$relisted_on, c("2020-02-01", NA_character_))  # closed then open
+  expect_equal(sum(is.na(h$relisted_on)), 1L)                  # exactly one open
+})
+
+test_that("build_archive_history: drops unclosed/negative history episodes", {
+  adf <- data.frame(package=character(0), first_release=character(0),
+    archived_on=character(0), last_version=character(0), removal_reason=character(0),
+    stringsAsFactors=FALSE)
+  hm <- list(Bad = list(
+    list(archived_on="2020-01-01", removal_reason=NA_character_, relisted_on=NA_character_),      # unclosed
+    list(archived_on="2021-05-05", removal_reason="x", relisted_on="2021-01-01")))                # negative
+  expect_equal(nrow(build_archive_history(adf, hm)), 0L)
+})
+
+test_that("build_archive_history: empty inputs -> zero-row frame with correct columns", {
+  adf <- data.frame(package=character(0), first_release=character(0),
+    archived_on=character(0), last_version=character(0), removal_reason=character(0),
+    stringsAsFactors=FALSE)
+  h <- build_archive_history(adf, list())
+  expect_equal(nrow(h), 0L)
+  expect_true(all(c("package","episode_seq","archived_on","relisted_on","removal_reason",
+    "last_version","relist_source","archived_on_source") %in% names(h)))
+})

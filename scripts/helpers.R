@@ -431,6 +431,59 @@ parse_packages_history <- function(text) {
   result
 }
 
+#' Compose the durable episode table: closed episodes (from X-CRAN-History) plus
+#' at most one open episode per package (the current archival, from archive_df).
+#' Only well-formed CLOSED history episodes are kept, so the sole NULL-relisted_on
+#' row per package is the open one (preserving the single-open invariant).
+build_archive_history <- function(archive_df, history_map = list()) {
+  empty <- data.frame(package=character(0), episode_seq=integer(0),
+    archived_on=character(0), relisted_on=character(0), removal_reason=character(0),
+    last_version=character(0), relist_source=character(0), archived_on_source=character(0),
+    stringsAsFactors=FALSE)
+
+  open_map <- list()
+  if (nrow(archive_df) > 0L) for (i in seq_len(nrow(archive_df))) {
+    p <- archive_df$package[i]
+    open_map[[p]] <- list(archived_on = archive_df$archived_on[i], relisted_on = NA_character_,
+      removal_reason = archive_df$removal_reason[i], last_version = archive_df$last_version[i],
+      relist_source = NA_character_, archived_on_source = "archive-rds")
+  }
+  all_pkgs <- union(names(history_map), names(open_map))
+  if (length(all_pkgs) == 0L) return(empty)
+
+  rows <- list()
+  for (p in all_pkgs) {
+    eps <- list()
+    for (e in (history_map[[p]] %||% list())) {
+      if (is.na(e$relisted_on)) next                                   # keep only closed
+      if (!is.na(e$archived_on) && e$relisted_on < e$archived_on) next # drop negative-duration
+      eps[[length(eps) + 1L]] <- list(archived_on = e$archived_on, relisted_on = e$relisted_on,
+        removal_reason = e$removal_reason, last_version = NA_character_,
+        relist_source = "x-cran-history", archived_on_source = "x-cran-history")
+    }
+    if (!is.null(open_map[[p]])) {
+      od  <- open_map[[p]]$archived_on
+      eps <- Filter(function(e) is.na(e$archived_on) || e$archived_on != od, eps)
+      eps[[length(eps) + 1L]] <- open_map[[p]]
+    }
+    if (length(eps) == 0L) next
+    eps <- eps[order(vapply(eps, function(e) e$archived_on %||% "", character(1L)))]
+    for (k in seq_along(eps)) {
+      e <- eps[[k]]
+      rows[[length(rows) + 1L]] <- data.frame(package = p, episode_seq = k,
+        archived_on = e$archived_on, relisted_on = e$relisted_on %||% NA_character_,
+        removal_reason = e$removal_reason %||% NA_character_,
+        last_version = e$last_version %||% NA_character_,
+        relist_source = e$relist_source %||% NA_character_,
+        archived_on_source = e$archived_on_source %||% NA_character_,
+        stringsAsFactors = FALSE)
+    }
+  }
+  if (length(rows) == 0L) return(empty)
+  out <- do.call(rbind, rows); rownames(out) <- NULL
+  out[order(out$package, out$episode_seq), , drop = FALSE]
+}
+
 #' Default IO providers: real network fetchers for production use.
 #'
 #' Returns a named list of zero-argument functions:
