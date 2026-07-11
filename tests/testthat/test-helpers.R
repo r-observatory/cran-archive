@@ -488,3 +488,31 @@ test_that("build_archive_history: closed episode colliding with the open archive
   expect_equal(nrow(h), 1L)          # only the open episode survives
   expect_true(is.na(h$relisted_on))  # and it is the open one
 })
+
+# ---------------------------------------------------------------------------
+# archived_on comes from the X-CRAN-Comment date, not the tarball mtime
+# ---------------------------------------------------------------------------
+
+test_that("comment_archived_on extracts the first ISO date from an X-CRAN-Comment", {
+  expect_equal(comment_archived_on("Archived on 2026-07-10 as email undeliverable."), "2026-07-10")
+  expect_equal(comment_archived_on("Removed on 2024-11-25 for misrepresentation."), "2024-11-25")
+  expect_true(is.na(comment_archived_on("Orphaned; maintainer unreachable.")))
+  expect_true(is.na(comment_archived_on(NA_character_)))
+  expect_true(is.na(comment_archived_on("")))
+})
+
+test_that("build_archive: archived_on is the X-CRAN-Comment date, not the tarball mtime", {
+  al <- list(tmcn = .make_archive_df("tmcn", c("0.1", "0.2-13"), c("2015-01-01", "2019-08-08")))
+  reasons <- c(tmcn = "Archived on 2026-07-10 as email to the maintainer is undeliverable.")
+  adf <- build_archive(al, current_pkgs = character(0), reasons = reasons)
+  expect_equal(adf$archived_on[adf$package == "tmcn"], "2026-07-10")
+  expect_equal(adf$first_release[adf$package == "tmcn"], "2015-01-01")
+  expect_equal(adf$last_version[adf$package == "tmcn"], "0.2-13")
+})
+
+test_that("build_archive: falls back to the max tarball mtime when the comment has no date", {
+  al <- list(nodate = .make_archive_df("nodate", c("1.0", "1.1"), c("2016-02-02", "2018-03-03")))
+  reasons <- c(nodate = "Orphaned; maintainer unreachable.")
+  adf <- build_archive(al, current_pkgs = character(0), reasons = reasons)
+  expect_equal(adf$archived_on[adf$package == "nodate"], "2018-03-03")
+})

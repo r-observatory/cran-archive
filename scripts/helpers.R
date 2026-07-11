@@ -16,6 +16,22 @@ parse_archive_version <- function(path, package) {
   m[2L]
 }
 
+#' Extract the archival date from an X-CRAN-Comment string.
+#'
+#' CRAN records the true archival date in the comment prose, e.g.
+#' "Archived on 2026-07-10 as ..." or "Removed on 2024-11-25 for ...". Returns
+#' the first ISO date (YYYY-MM-DD) found, or NA_character_ when the comment is
+#' absent or carries no date.
+#'
+#' @param comment A single X-CRAN-Comment string (or NA).
+comment_archived_on <- function(comment) {
+  if (is.null(comment) || length(comment) == 0L || is.na(comment) || !nzchar(comment)) {
+    return(NA_character_)
+  }
+  m <- regmatches(comment, regexpr("[0-9]{4}-[0-9]{2}-[0-9]{2}", comment))
+  if (length(m) == 0L || !nzchar(m[1L])) NA_character_ else m[1L]
+}
+
 #' Build a data.frame of currently-archived CRAN packages.
 #'
 #' A package is considered currently archived if it appears in archive_list but
@@ -51,10 +67,16 @@ build_archive <- function(archive_list, current_pkgs, reasons = character(0)) {
     min_idx <- which.min(mt)
     max_idx <- which.max(mt)
     first_release  <- format(as.Date(mt[min_idx]), "%Y-%m-%d")
-    archived_on    <- format(as.Date(mt[max_idx]), "%Y-%m-%d")
     last_path      <- rownames(df)[max_idx]
     last_version   <- parse_archive_version(last_path, pkg)
     removal_reason <- if (pkg %in% names(reasons)) unname(reasons[pkg]) else NA_character_
+    # The max tarball mtime is only the LAST-RELEASE date, which can predate the
+    # actual archival by years (a stable package archived when its maintainer's
+    # email became undeliverable, say). CRAN records the true archival date in the
+    # X-CRAN-Comment ("Archived on YYYY-MM-DD ..."); prefer it, and fall back to
+    # the tarball mtime only when the comment carries no date.
+    archived_on    <- comment_archived_on(removal_reason) %||%
+                        format(as.Date(mt[max_idx]), "%Y-%m-%d")
     data.frame(
       package        = pkg,
       first_release  = first_release,
