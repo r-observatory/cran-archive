@@ -446,7 +446,9 @@ export_names_all <- function(con, names_df) {
 #' collapse whitespace. Returns NA_character_ when nothing remains.
 clean_history_reason <- function(x) {
   x <- trimws(x)
-  x <- sub("^as[[:space:]]+", "", x)
+  # Strip the connector CRAN uses after the archival date ("as"/"for"/"at"),
+  # matching clean_comment_reason so open- and closed-episode reasons read the same.
+  x <- sub("^(as|for|at)[[:space:]]+", "", x)
   x <- sub("[.[:space:]]+$", "", x)
   x <- gsub("[[:space:]]+", " ", x)
   if (!nzchar(x)) NA_character_ else x

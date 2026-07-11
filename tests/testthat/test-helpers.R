@@ -547,3 +547,12 @@ test_that("build_archive stores the cleaned reason alongside the comment date", 
   expect_equal(adf$archived_on[adf$package == "tmcn"], "2026-07-10")
   expect_equal(adf$removal_reason[adf$package == "tmcn"], "email to the maintainer is undeliverable")
 })
+
+test_that("parse_history_episodes: strips for/at connectors in the reason, not only 'as'", {
+  eps <- parse_history_episodes(
+    "Archived on 2021-12-31 for repeated policy violation. Unarchived on 2022-02-01.")
+  expect_equal(eps[[1]]$removal_reason, "repeated policy violation")
+  eps2 <- parse_history_episodes(
+    "Archived on 2020-05-05 at the maintainer's request. Unarchived on 2020-06-06.")
+  expect_equal(eps2[[1]]$removal_reason, "the maintainer's request")
+})
