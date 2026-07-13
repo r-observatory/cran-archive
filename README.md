@@ -76,3 +76,7 @@ Rscript scripts/update.R out/            # incremental (change-gated)
 Rscript scripts/update.R out/ --bootstrap  # full rebuild
 Rscript tests/testthat.R                 # unit tests
 ```
+
+## Feedback
+
+Found a bug, a wrong number, or a missing package? Report it at [r-observatory/feedback](https://github.com/r-observatory/feedback/issues/new/choose). All feedback about R Observatory, the site, the data, and the pipelines, is tracked in one place.
