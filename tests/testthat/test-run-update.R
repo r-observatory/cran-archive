@@ -286,6 +286,53 @@ test_that("run_update: manifest.json on disk matches returned manifest", {
 })
 
 # ---------------------------------------------------------------------------
+# Integrity / completeness core
+# ---------------------------------------------------------------------------
+
+test_that("run_update: manifest carries the integrity core over the finalized DB", {
+  tmp <- withr::local_tempdir(); out <- file.path(tmp, "out")
+
+  # Low floors so the names write runs: the DB is the full, non-partial set.
+  res <- run_update(make_stub_io(), out, force_full = TRUE,
+                    live_floor = 0L, archive_floor = 0L)
+  m  <- res$manifest
+  db <- file.path(out, "cran-archive.db")
+
+  expect_equal(m$db_filename, "cran-archive.db")
+  expect_type(m$db_bytes, "double")
+  expect_equal(m$db_bytes, file.size(db))
+  expect_match(m$db_sha256, "^[0-9a-f]{64}$")
+  # The hash is over the finalized file bytes: recomputing now (all connections
+  # closed) reproduces it exactly.
+  expect_equal(m$db_sha256, file_sha256(db))
+  # tables enumerates the real user tables and their counts.
+  expect_equal(m$tables$cran_archive, m$n_archived)
+  expect_true("cran_names_all" %in% names(m$tables))
+})
+
+test_that("run_update: complete=TRUE when the full DB (incl. names) is written", {
+  tmp <- withr::local_tempdir(); out <- file.path(tmp, "out")
+  res <- run_update(make_stub_io(), out, force_full = TRUE,
+                    live_floor = 0L, archive_floor = 0L)
+  expect_false(is.na(res$manifest$n_names))
+  expect_true(res$manifest$complete)
+})
+
+test_that("run_update: complete=FALSE and no names table when prior is unreachable", {
+  tmp <- withr::local_tempdir(); out <- file.path(tmp, "out")
+  io <- make_stub_io()
+  io$prev_names <- function() stop("prior release unreachable")
+
+  res <- run_update(io, out, force_full = TRUE, live_floor = 0L, archive_floor = 0L)
+  m <- res$manifest
+
+  expect_false(m$names_healthy)
+  expect_true(is.na(m$n_names))
+  expect_false(m$complete)                            # partial DB, honestly flagged
+  expect_false("cran_names_all" %in% names(m$tables)) # names table genuinely absent
+})
+
+# ---------------------------------------------------------------------------
 # Fetch-sanity guard
 # ---------------------------------------------------------------------------
 
