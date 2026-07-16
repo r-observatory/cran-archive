@@ -114,31 +114,55 @@ run_update <- function(io, out_dir, force_full = FALSE,
   } else if (names_gate_ok) {
     merged <- merge_names_all(prior, build_names_all(archive_list, current_pkgs), now_stamp)
     con <- RSQLite::dbConnect(RSQLite::SQLite(), db_path)
-    on.exit(RSQLite::dbDisconnect(con), add = TRUE)
-    export_names_all(con, merged)
+    # Disconnect as soon as the write is done (not deferred to function exit) so
+    # the DB has no open handle when the integrity core hashes its bytes below.
+    tryCatch(export_names_all(con, merged),
+             finally = RSQLite::dbDisconnect(con))
     n_names <- nrow(merged)
   } else if (nrow(prior) > 0L) {
     message("names size gate failed (live=", n_live, ", archive=", n_arch,
             "); reusing the prior cran_names_all")
     con <- RSQLite::dbConnect(RSQLite::SQLite(), db_path)
-    on.exit(RSQLite::dbDisconnect(con), add = TRUE)
-    export_names_all(con, prior)
+    tryCatch(export_names_all(con, prior),
+             finally = RSQLite::dbDisconnect(con))
     n_names <- nrow(prior)
   }
 
-  # 6. Write manifest
-  manifest <- list(
-    release             = paste0("v", format(Sys.time(), "%Y%m%d-%H%M%S", tz = "UTC")),
-    generated_at        = iso(Sys.time()),
-    n_archived          = nrow(archive_df),
-    n_events            = nrow(events_df),
-    changed             = changed,
-    n_names             = n_names,
-    names_gate_ok       = names_gate_ok,
-    names_healthy       = names_healthy,
-    source              = list(
-      archive_fingerprint = archive_fingerprint
-    )
+  # 6. Integrity / completeness core over the finalized DB FILE. Every
+  #    connection to db_path is closed above (export_archive and each names
+  #    write disconnect before returning), so db_bytes/db_sha256 hash the exact
+  #    published bytes.
+  #
+  #    complete = full-not-partial: the DB holds the full dataset the merge
+  #    consumes. The archive tables are always a full stateless rebuild (a
+  #    truncated fetch aborts before any write via the fetch-sanity floor), so
+  #    the only conditionally-present table is cran_names_all, written only when
+  #    a names write actually ran (n_names is non-NA). When the prior names
+  #    table is unreachable, or a partial fetch fails the size gate with no
+  #    prior to reuse, the DB is written WITHOUT that table, a partial DB the
+  #    release step also declines to publish. complete is therefore DERIVED from
+  #    whether the names table was written, not hardcoded. This is completeness,
+  #    not freshness; freshness is tracked separately via generated_at and
+  #    source.archive_fingerprint.
+  core <- db_integrity_core(db_path, complete = !is.na(n_names))
+
+  # 7. Write manifest (existing fields preserved; the integrity/completeness
+  #    core is merged in as TOP-LEVEL fields via c(), not nested).
+  manifest <- c(
+    list(
+      release             = paste0("v", format(Sys.time(), "%Y%m%d-%H%M%S", tz = "UTC")),
+      generated_at        = iso(Sys.time()),
+      n_archived          = nrow(archive_df),
+      n_events            = nrow(events_df),
+      changed             = changed,
+      n_names             = n_names,
+      names_gate_ok       = names_gate_ok,
+      names_healthy       = names_healthy,
+      source              = list(
+        archive_fingerprint = archive_fingerprint
+      )
+    ),
+    core
   )
   write_manifest(manifest_path, manifest)
 
