@@ -808,11 +808,261 @@ build_archive_lineage <- function(dcf) {
   out[order(out$package, out$seq), , drop = FALSE]
 }
 
+# ---------------------------------------------------------------------------
+# The live CRAN list
+# ---------------------------------------------------------------------------
+
+#' CRAN's PACKAGES index as available.packages() reads it, with only the
+#' duplicates filter. The default filters would drop OS_type: windows packages
+#' and any package needing a newer R than this runner, which would mark live
+#' packages as archived. A Recommended package listed twice keeps one row.
+cran_available <- function(repos) {
+  utils::available.packages(repos = repos, type = "source", filters = "duplicates")
+}
+
+#' Package, version and MD5sum from the main-tree rows of an
+#' available.packages() matrix (not the Path: <R version>/Recommended copies).
+#' An empty MD5sum is NA.
+packages_md5_from <- function(ap, contriburl) {
+  main <- sub("/+$", "", ap[, "Repository"]) == sub("/+$", "", contriburl)
+  md5  <- unname(ap[main, "MD5sum"])
+  md5[!is.na(md5) & !nzchar(md5)] <- NA_character_
+  data.frame(package = unname(ap[main, "Package"]),
+             version = unname(ap[main, "Version"]),
+             md5sum  = md5, stringsAsFactors = FALSE)
+}
+
+# ---------------------------------------------------------------------------
+# cran_tarballs: exact size, mtime and MD5 of every CRAN source tarball
+# ---------------------------------------------------------------------------
+
+TARBALL_COLS <- c("package", "version", "revision", "size_bytes", "mtime",
+                  "md5sum", "listing", "first_seen", "last_seen")
+
+#' A zero-row cran_tarballs frame.
+empty_tarballs <- function() {
+  data.frame(package = character(0), version = character(0), revision = integer(0),
+             size_bytes = integer(0), mtime = character(0), md5sum = character(0),
+             listing = character(0), first_seen = character(0),
+             last_seen = character(0), stringsAsFactors = FALSE)
+}
+
+#' One row per source tarball in today's indexes: package, version, size_bytes
+#' (integer bytes), mtime (UTC, whole seconds), md5sum and listing.
+#'
+#' archive_list is Meta/archive.rds (package -> file.info frame keyed by
+#' "<pkg>/<pkg>_<ver>.tar.gz"); paths of any other shape, such as
+#' "calibFit/Ancestry/calib_2.0.1.tar.gz" or "relax/Old/relax_1.00.tar.gz",
+#' are skipped. current_df is Meta/current.rds (keyed "<pkg>_<ver>.tar.gz").
+#' md5_df is packages_md5_from() or NULL; the MD5 goes on current files only.
+#' A file in both indexes at once is kept once, as current.
+build_tarball_snapshot <- function(archive_list, current_df, md5_df) {
+  n     <- vapply(archive_list, NROW, integer(1))
+  pkg   <- rep(names(archive_list), n)
+  path  <- as.character(unlist(lapply(archive_list, rownames), use.names = FALSE))
+  size  <- as.numeric(unlist(lapply(archive_list, function(d) d$size), use.names = FALSE))
+  mt    <- as.numeric(unlist(lapply(archive_list, function(d) as.numeric(d$mtime)),
+                             use.names = FALSE))
+  prefix <- paste0(pkg, "/", pkg, "_")
+  ver    <- substr(path, nchar(prefix) + 1L, nchar(path) - 7L)
+  keep   <- startsWith(path, prefix) & endsWith(path, ".tar.gz") &
+            nzchar(ver) & !grepl("/", ver, fixed = TRUE)
+
+  files <- rownames(current_df) %||% character(0)
+  m     <- regmatches(files, regexec("^([^_/]+)_([^_/]+)\\.tar\\.gz$", files))
+  ok    <- lengths(m) == 3L
+
+  snap <- data.frame(
+    package    = c(pkg[keep], vapply(m[ok], `[`, "", 2L)),
+    version    = c(ver[keep], vapply(m[ok], `[`, "", 3L)),
+    size       = c(size[keep], as.numeric(current_df$size)[ok]),
+    mt         = c(mt[keep], as.numeric(current_df$mtime)[ok]),
+    listing    = c(rep("archive", sum(keep)), rep("current", sum(ok))),
+    stringsAsFactors = FALSE)
+  snap <- snap[!is.na(snap$size) & !is.na(snap$mt), , drop = FALSE]
+  snap$size_bytes <- as.integer(round(snap$size))
+  snap$mtime      <- format(.POSIXct(snap$mt, tz = "UTC"), "%Y-%m-%dT%H:%M:%SZ", tz = "UTC")
+
+  # A file caught in both listings mid-move counts once, as current.
+  snap <- snap[order(snap$listing != "current"), , drop = FALSE]
+  dup  <- duplicated(paste(snap$package, snap$version, snap$size_bytes, snap$mtime, sep = "\t"))
+  snap <- snap[!dup, , drop = FALSE]
+
+  if (is.null(md5_df)) md5_df <- data.frame(package = character(0), version = character(0),
+                                            md5sum = character(0), stringsAsFactors = FALSE)
+  hit <- match(paste(snap$package, snap$version, sep = "\t"),
+               paste(md5_df$package, md5_df$version, sep = "\t"))
+  snap$md5sum <- as.character(ifelse(snap$listing == "current", md5_df$md5sum[hit], NA_character_))
+
+  snap <- snap[order(snap$package, snap$version, snap$mtime),
+               c("package", "version", "size_bytes", "mtime", "md5sum", "listing"), drop = FALSE]
+  rownames(snap) <- NULL
+  snap
+}
+
+#' Whether a snapshot is complete enough to fold in: at least min_current
+#' current files and min_archive archived packages. A failed read (NULL) never is.
+tarball_snapshot_healthy <- function(snapshot, min_current = CURRENT_PKGS_FLOOR,
+                                     min_archive = ARCHIVE_LIST_FLOOR) {
+  if (!is.data.frame(snapshot)) return(FALSE)
+  n_current <- sum(snapshot$listing == "current")
+  n_archive <- length(unique(snapshot$package[snapshot$listing == "archive"]))
+  n_current >= min_current && n_archive >= min_archive
+}
+
+#' Fold today's snapshot into the prior cran_tarballs.
+#'
+#' A file is identified by (size_bytes, mtime) within its (package, version);
+#' the MD5 is an attribute. A known file advances last_seen, takes today's
+#' listing and, when PACKAGES gives one, today's MD5 (filling a NULL or
+#' replacing a stale one). An unknown file opens revision max + 1, numbered by
+#' mtime when several arrive at once. A file in the snapshot more than once is
+#' taken once. A stored file not listed today becomes 'gone' with last_seen
+#' frozen. More than storm_max new files for versions already recorded returns
+#' the prior table unchanged with state "storm".
+#'
+#' @return list(table, state = "cold_start" | "updated" | "storm", new_revisions)
+merge_tarballs <- function(prior, snapshot, today, storm_max = TARBALL_REVISION_STORM_MAX) {
+  if (is.null(prior)) prior <- empty_tarballs()
+  prior <- prior[, TARBALL_COLS, drop = FALSE]
+  prior$revision   <- as.integer(prior$revision)
+  prior$size_bytes <- as.integer(prior$size_bytes)
+  snapshot$size_bytes <- as.integer(snapshot$size_bytes)
+
+  file_key <- function(d) paste(d$package, d$version, sprintf("%d", d$size_bytes), d$mtime, sep = "\t")
+  pv_key   <- function(d) paste(d$package, d$version, sep = "\t")
+
+  # One row per file, or a file listed twice would open two revisions. The
+  # current row wins, then a row with an MD5.
+  snapshot <- snapshot[order(snapshot$listing != "current", is.na(snapshot$md5sum)), , drop = FALSE]
+  snapshot <- snapshot[!duplicated(file_key(snapshot)), , drop = FALSE]
+
+  pk <- file_key(prior)
+  sk <- file_key(snapshot)
+
+  out  <- prior
+  hit  <- match(pk, sk)
+  seen <- !is.na(hit)
+  out$last_seen[seen] <- today
+  out$listing[seen]   <- snapshot$listing[hit[seen]]
+  md5 <- snapshot$md5sum[hit[seen]]
+  out$md5sum[seen][!is.na(md5)] <- md5[!is.na(md5)]
+  out$listing[!seen] <- "gone"
+
+  fresh <- snapshot[!(sk %in% pk), , drop = FALSE]
+  fresh <- fresh[order(fresh$package, fresh$version, fresh$mtime), , drop = FALSE]
+  fresh_pv <- pv_key(fresh)
+  known    <- fresh_pv %in% pv_key(prior)
+  if (sum(known) > storm_max) {
+    return(list(table = prior, state = "storm", new_revisions = 0L))
+  }
+  top  <- if (nrow(prior) > 0L) tapply(prior$revision, pv_key(prior), max) else integer(0)
+  base <- ifelse(known, top[fresh_pv], 0L)
+  rank <- ave(seq_along(fresh_pv), fresh_pv, FUN = seq_along)
+  added <- data.frame(
+    package = fresh$package, version = fresh$version,
+    revision = as.integer(base + rank), size_bytes = fresh$size_bytes,
+    mtime = fresh$mtime, md5sum = as.character(fresh$md5sum), listing = fresh$listing,
+    first_seen = rep(today, nrow(fresh)), last_seen = rep(today, nrow(fresh)),
+    stringsAsFactors = FALSE)
+
+  table <- rbind(out, added)
+  table <- table[order(table$package, table$version, table$revision), , drop = FALSE]
+  rownames(table) <- NULL
+  list(table = table,
+       state = if (nrow(prior) == 0L) "cold_start" else "updated",
+       new_revisions = nrow(added))
+}
+
+#' Write cran_tarballs into an open connection, replacing any earlier copy.
+export_tarballs <- function(con, df) {
+  DBI::dbWithTransaction(con, {
+    RSQLite::dbExecute(con, "DROP TABLE IF EXISTS cran_tarballs")
+    RSQLite::dbExecute(con, "
+      CREATE TABLE cran_tarballs (
+        package TEXT NOT NULL, version TEXT NOT NULL,
+        revision INTEGER NOT NULL,   -- 1 for the first file seen, +1 per replacement
+        size_bytes INTEGER NOT NULL,
+        mtime TEXT NOT NULL,         -- UTC ISO-8601
+        md5sum TEXT,                 -- from PACKAGES while current
+        listing TEXT NOT NULL,       -- 'current' | 'archive' | 'gone'
+        first_seen TEXT NOT NULL, last_seen TEXT NOT NULL,
+        PRIMARY KEY (package, version, revision),
+        CHECK (last_seen >= first_seen)) WITHOUT ROWID")
+    if (nrow(df) > 0L) {
+      RSQLite::dbWriteTable(con, "cran_tarballs", df[, TARBALL_COLS, drop = FALSE], append = TRUE)
+    }
+  })
+  invisible(nrow(df))
+}
+
+#' cran_names_all from a downloaded prior database, or zero rows when that
+#' database never had the table (the genuine cold start).
+read_prev_names <- function(db_path) {
+  con <- RSQLite::dbConnect(RSQLite::SQLite(), db_path)
+  on.exit(RSQLite::dbDisconnect(con), add = TRUE)
+  if (!RSQLite::dbExistsTable(con, "cran_names_all")) {
+    return(data.frame(name_lower = character(0), canonical_name = character(0),
+                      identity_state = character(0), first_seen = character(0),
+                      last_seen = character(0), stringsAsFactors = FALSE))
+  }
+  RSQLite::dbGetQuery(con, "SELECT * FROM cran_names_all")
+}
+
+#' cran_tarballs from a downloaded prior database, or zero rows when that
+#' database never had the table (the first run then numbers every file).
+#' Throws when the file cannot be read, which the caller treats as unreachable.
+read_prev_tarballs <- function(db_path) {
+  con <- RSQLite::dbConnect(RSQLite::SQLite(), db_path)
+  on.exit(RSQLite::dbDisconnect(con), add = TRUE)
+  if (!RSQLite::dbExistsTable(con, "cran_tarballs")) return(empty_tarballs())
+  RSQLite::dbGetQuery(con, paste("SELECT", paste(TARBALL_COLS, collapse = ", "),
+                                 "FROM cran_tarballs"))
+}
+
+#' Build and write cran_tarballs for one run into the database at db_path.
+#'
+#' States: "cold_start" and "updated" wrote the merged table; "carried" (the
+#' current index failed or came back too small) and "storm" wrote the prior
+#' table back unchanged; "unreachable" (the prior table could not be read)
+#' wrote nothing, and that database must not be published. When building the
+#' snapshot throws, the state is "carried" and the error text is logged and
+#' returned as error, which is NA otherwise.
+#' @return list(state, n_tarballs, revisions_new, error)
+update_tarballs <- function(io, db_path, archive_list, today,
+                            min_current = CURRENT_PKGS_FLOOR,
+                            min_archive = ARCHIVE_LIST_FLOOR,
+                            storm_max = TARBALL_REVISION_STORM_MAX) {
+  prior <- tryCatch(io$prev_tarballs(), error = function(e) NULL)
+  if (is.null(prior)) {
+    return(list(state = "unreachable", n_tarballs = NA, revisions_new = NA,
+                error = NA_character_))
+  }
+  snap_error <- NA_character_
+  snapshot <- tryCatch(
+    build_tarball_snapshot(archive_list, io$current_rds(),
+                           tryCatch(io$packages_md5(), error = function(e) NULL)),
+    error = function(e) {
+      snap_error <<- conditionMessage(e)
+      message("cran_tarballs snapshot failed: ", snap_error)
+      NULL
+    })
+  merged <- if (tarball_snapshot_healthy(snapshot, min_current, min_archive)) {
+    merge_tarballs(prior, snapshot, today, storm_max)
+  } else {
+    list(table = prior, state = "carried", new_revisions = 0L)
+  }
+  con <- RSQLite::dbConnect(RSQLite::SQLite(), db_path)
+  tryCatch(export_tarballs(con, merged$table), finally = RSQLite::dbDisconnect(con))
+  list(state = merged$state, n_tarballs = nrow(merged$table),
+       revisions_new = as.integer(merged$new_revisions), error = snap_error)
+}
+
 #' Default IO providers: real network fetchers for production use.
 #'
 #' Returns a named list of zero-argument functions:
 #'   archive_rds()      -- downloads and returns the CRAN archive.rds named list.
-#'   current_packages() -- returns a character vector of currently-available packages.
+#'   current_packages() -- the live CRAN package names, from cran_available().
 #'   removal_reasons()  -- fetches PACKAGES.in and returns a named character vector
 #'                         mapping package name -> X-CRAN-Comment value.
 #'   removal_history()  -- fetches PACKAGES.in (cached with removal_reasons() in the
@@ -820,30 +1070,33 @@ build_archive_lineage <- function(dcf) {
 #'                         episodes, package -> list of episodes.
 #'   packages_dcf()     -- fetches PACKAGES.in (same cache) and returns it parsed as
 #'                         a read.dcf() character matrix for the event lineage.
-#'   prev_names()       -- downloads the prior published database and returns its
-#'                         cran_names_all table (0-row on a genuine cold start;
-#'                         throws when the prior release is unreachable).
+#'   packages_md5()     -- package, version and MD5sum of the main-tree PACKAGES rows.
+#'   current_rds()      -- Meta/current.rds: file.info of every current tarball.
+#'   prev_names()       -- the prior published database's cran_names_all table
+#'                         (0-row on a genuine cold start; throws when the prior
+#'                         release is unreachable).
+#'   prev_tarballs()    -- the prior database's cran_tarballs (0-row before the
+#'                         first publish of it; throws when unreachable).
 default_io <- function() {
-  .pin <- NULL
+  .pin  <- NULL
+  .ap   <- NULL
+  .prev <- NULL
   packages_in <- function() {
     if (is.null(.pin)) {
       .pin <<- paste(readLines(url(CRAN_PACKAGES_IN_URL), warn = FALSE), collapse = "\n")
     }
     .pin
   }
-  list(
-    archive_rds      = function() readRDS(url(CRAN_ARCHIVE_URL)),
-    current_packages = function() rownames(available.packages(repos = CRAN_PACKAGES_URL)),
-    removal_reasons  = function() parse_packages_in(packages_in()),
-    removal_history  = function() parse_packages_history(packages_in()),
-    packages_dcf     = function() read.dcf(textConnection(packages_in())),
-
-    prev_names = function() {
-      empty <- data.frame(name_lower = character(0), canonical_name = character(0),
-                          identity_state = character(0), first_seen = character(0),
-                          last_seen = character(0), stringsAsFactors = FALSE)
+  # One PACKAGES read per run, shared by every reader of it.
+  available <- function() {
+    if (is.null(.ap)) .ap <<- cran_available(CRAN_PACKAGES_URL)
+    .ap
+  }
+  # The prior published database, downloaded once per run for both tables. It
+  # sits under the session temp directory, which R removes on exit.
+  prev_db <- function() {
+    if (is.null(.prev)) {
       tmp <- tempfile(); dir.create(tmp, showWarnings = FALSE)
-      on.exit(unlink(tmp, recursive = TRUE), add = TRUE)
       st <- suppressWarnings(system2("gh",
         c("release", "download", "current", "--repo", PUBLISH_REPO,
           "--pattern", DB_FILENAME, "--dir", tmp, "--clobber"),
@@ -855,12 +1108,20 @@ default_io <- function() {
       if (!identical(as.integer(st), 0L) || !file.exists(db)) {
         stop("prior release unreachable")
       }
-      con <- RSQLite::dbConnect(RSQLite::SQLite(), db)
-      on.exit(RSQLite::dbDisconnect(con), add = TRUE)
-      # A successful download with no cran_names_all table is the genuine
-      # cold-start case: the table has simply never been published yet.
-      if (!RSQLite::dbExistsTable(con, "cran_names_all")) return(empty)
-      RSQLite::dbGetQuery(con, "SELECT * FROM cran_names_all")
+      .prev <<- db
     }
+    .prev
+  }
+  list(
+    archive_rds      = function() readRDS(url(CRAN_ARCHIVE_URL)),
+    current_packages = function() rownames(available()),
+    packages_md5     = function() packages_md5_from(available(),
+                                    contrib.url(CRAN_PACKAGES_URL, type = "source")),
+    current_rds      = function() readRDS(url(CRAN_CURRENT_URL)),
+    removal_reasons  = function() parse_packages_in(packages_in()),
+    removal_history  = function() parse_packages_history(packages_in()),
+    packages_dcf     = function() read.dcf(textConnection(packages_in())),
+    prev_names       = function() read_prev_names(prev_db()),
+    prev_tarballs    = function() read_prev_tarballs(prev_db())
   )
 }

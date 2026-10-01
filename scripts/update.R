@@ -4,6 +4,8 @@
 # Fetches the CRAN archive.rds and the current-packages list, identifies
 # packages that are currently archived (in archive.rds but absent from the live
 # CRAN listing), and writes a SQLite catalog plus a JSON manifest to out_dir.
+# It also records the exact size, mtime and MD5 of every source tarball in
+# cran_tarballs, carried forward from the prior published database.
 #
 # run_update(io, out_dir, force_full) takes an injectable io for offline testing.
 # default_io() (in helpers.R) supplies the real network fetchers. min_current and
@@ -128,6 +130,14 @@ run_update <- function(io, out_dir, force_full = FALSE,
     n_names <- nrow(prior)
   }
 
+  # cran_tarballs carries state from the prior database, so it is written only
+  # when that database was reachable.
+  tarballs <- if (names_healthy) {
+    update_tarballs(io, db_path, archive_list, now_stamp, min_current, min_archive)
+  } else {
+    list(state = "skipped", n_tarballs = NA, revisions_new = NA, error = NA_character_)
+  }
+
   # 6. Integrity / completeness core over the finalized DB FILE. Every
   #    connection to db_path is closed above (export_archive and each names
   #    write disconnect before returning), so db_bytes/db_sha256 hash the exact
@@ -143,8 +153,9 @@ run_update <- function(io, out_dir, force_full = FALSE,
   #    release step also declines to publish. complete is therefore DERIVED from
   #    whether the names table was written, not hardcoded. This is completeness,
   #    not freshness; freshness is tracked separately via generated_at and
-  #    source.archive_fingerprint.
-  core <- db_integrity_core(db_path, complete = !is.na(n_names))
+  #    source.archive_fingerprint. cran_tarballs is conditional the same way.
+  core <- db_integrity_core(db_path,
+                            complete = !is.na(n_names) && !is.na(tarballs$n_tarballs))
 
   # 7. Write manifest (existing fields preserved; the integrity/completeness
   #    core is merged in as TOP-LEVEL fields via c(), not nested).
@@ -158,6 +169,10 @@ run_update <- function(io, out_dir, force_full = FALSE,
       n_names             = n_names,
       names_gate_ok       = names_gate_ok,
       names_healthy       = names_healthy,
+      n_tarballs            = tarballs$n_tarballs,
+      tarball_revisions_new = tarballs$revisions_new,
+      tarballs_state        = tarballs$state,
+      tarballs_error        = tarballs$error,
       source              = list(
         archive_fingerprint = archive_fingerprint
       )

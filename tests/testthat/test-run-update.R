@@ -20,10 +20,10 @@ if (!exists("run_update", mode = "function")) {
 
 .tp2 <- function(pkg, ver) paste0(pkg, "/", pkg, "_", ver, ".tar.gz")
 
-.make_adf <- function(pkg, versions, dates) {
+.make_adf <- function(pkg, versions, dates, sizes = rep(1000, length(versions))) {
   paths        <- vapply(versions, function(v) .tp2(pkg, v), character(1L))
   mt           <- as.POSIXct(dates, tz = "UTC")
-  df           <- data.frame(mtime = mt, stringsAsFactors = FALSE)
+  df           <- data.frame(size = as.numeric(sizes), mtime = mt, stringsAsFactors = FALSE)
   rownames(df) <- paths
   df
 }
@@ -37,6 +37,12 @@ FIXTURE_ARCHIVE <- list(
   PkgSingle   = .make_adf("PkgSingle",   c("3.0-1"),      c("2013-07-20"))
 )
 FIXTURE_CURRENT_PKGS <- c("PkgCurrent")
+
+# Meta/current.rds and PACKAGES MD5 rows for the one live package.
+FIXTURE_CURRENT_RDS <- data.frame(size = 2048, mtime = as.POSIXct("2024-02-01", tz = "UTC"),
+                                  row.names = "PkgCurrent_0.7.tar.gz")
+FIXTURE_MD5 <- data.frame(package = "PkgCurrent", version = "0.7",
+                          md5sum = "5d41402abc4b2a76b9719d911017c592", stringsAsFactors = FALSE)
 
 .empty_names_df <- function() {
   data.frame(name_lower = character(0), canonical_name = character(0),
@@ -61,14 +67,20 @@ make_stub_io <- function(archive = FIXTURE_ARCHIVE,
                          reasons = character(0),
                          history = list(),
                          prev_names = .empty_names_df(),
-                         packages_dcf = .stub_dcf()) {
+                         packages_dcf = .stub_dcf(),
+                         current_rds = FIXTURE_CURRENT_RDS,
+                         packages_md5 = FIXTURE_MD5,
+                         prev_tarballs = empty_tarballs()) {
   list(
     archive_rds      = function() archive,
     current_packages = function() current,
     removal_reasons  = function() reasons,
     removal_history  = function() history,
     prev_names       = function() prev_names,
-    packages_dcf     = function() packages_dcf
+    packages_dcf     = function() packages_dcf,
+    current_rds      = function() current_rds,
+    packages_md5     = function() packages_md5,
+    prev_tarballs    = function() prev_tarballs
   )
 }
 
@@ -347,4 +359,113 @@ test_that("run_update: aborts on an implausibly small current-packages fetch", {
 test_that("run_update: force_full bypasses the fetch-sanity floors", {
   tmp <- withr::local_tempdir(); out <- file.path(tmp, "out")
   expect_silent(run_update(make_stub_io(), out, force_full = TRUE))
+})
+
+# ---------------------------------------------------------------------------
+# cran_tarballs
+# ---------------------------------------------------------------------------
+
+.read_tarballs <- function(out) {
+  con <- RSQLite::dbConnect(RSQLite::SQLite(), file.path(out, "cran-archive.db"))
+  on.exit(RSQLite::dbDisconnect(con), add = TRUE)
+  if (!RSQLite::dbExistsTable(con, "cran_tarballs")) return(NULL)
+  RSQLite::dbGetQuery(con, "SELECT * FROM cran_tarballs ORDER BY package, version, revision")
+}
+
+test_that("run_update: a first run records every archived and current file", {
+  tmp <- withr::local_tempdir(); out <- file.path(tmp, "out")
+  res <- run_update(make_stub_io(), out, force_full = TRUE, min_current = 0L, min_archive = 0L)
+  t <- .read_tarballs(out)
+  expect_equal(nrow(t), 6L)   # 5 archived files + PkgCurrent 0.7
+  cur <- t[t$listing == "current", ]
+  expect_equal(cur$package, "PkgCurrent")
+  expect_equal(cur$size_bytes, 2048L)
+  expect_equal(cur$md5sum, "5d41402abc4b2a76b9719d911017c592")
+  expect_equal(res$manifest$tarballs_state, "cold_start")
+  expect_equal(res$manifest$n_tarballs, 6L)
+  expect_equal(res$manifest$tarball_revisions_new, 6L)
+  expect_equal(res$manifest$tables$cran_tarballs, 6L)
+})
+
+test_that("run_update: a second run on the published table only moves last_seen", {
+  tmp <- withr::local_tempdir(); out <- file.path(tmp, "out")
+  run_update(make_stub_io(), out, force_full = TRUE, min_current = 0L, min_archive = 0L)
+  prior <- .read_tarballs(out)
+  prior$first_seen <- "2026-09-01"; prior$last_seen <- "2026-09-01"
+  res <- run_update(make_stub_io(prev_tarballs = prior), out, force_full = TRUE,
+                    min_current = 0L, min_archive = 0L)
+  t <- .read_tarballs(out)
+  expect_equal(res$manifest$tarballs_state, "updated")
+  expect_equal(res$manifest$tarball_revisions_new, 0L)
+  expect_true(all(t$first_seen == "2026-09-01"))
+  expect_true(all(t$last_seen > "2026-09-01"))
+})
+
+test_that("run_update: a failed current index writes the prior table back unchanged", {
+  tmp <- withr::local_tempdir(); out <- file.path(tmp, "out")
+  run_update(make_stub_io(), out, force_full = TRUE, min_current = 0L, min_archive = 0L)
+  prior <- .read_tarballs(out)
+  io <- make_stub_io(prev_tarballs = prior)
+  io$current_rds <- function() stop("HTTP 503")
+  res <- suppressMessages(
+    run_update(io, out, force_full = TRUE, min_current = 0L, min_archive = 0L))
+  expect_equal(res$manifest$tarballs_state, "carried")
+  expect_equal(res$manifest$tarball_revisions_new, 0L)
+  expect_equal(.read_tarballs(out), prior)
+})
+
+test_that("run_update: a snapshot that fails shows its error in the run output and the manifest", {
+  tmp <- withr::local_tempdir(); out <- file.path(tmp, "out")
+  io <- make_stub_io()
+  io$current_rds <- function() stop("HTTP 503")
+  expect_message(
+    res <- run_update(io, out, force_full = TRUE, min_current = 0L, min_archive = 0L),
+    "cran_tarballs snapshot failed: HTTP 503", fixed = TRUE)
+  expect_equal(res$manifest$tarballs_state, "carried")
+  expect_equal(res$manifest$tarballs_error, "HTTP 503")
+  on_disk <- jsonlite::read_json(file.path(out, "manifest.json"))
+  expect_equal(on_disk$tarballs_state, "carried")
+  expect_equal(on_disk$tarballs_error, "HTTP 503")
+})
+
+test_that("run_update: a snapshot that builds has no tarballs_error, whether merged or too small", {
+  tmp <- withr::local_tempdir(); out <- file.path(tmp, "out")
+  res <- run_update(make_stub_io(), out, force_full = TRUE, min_current = 0L, min_archive = 0L)
+  expect_equal(res$manifest$tarballs_state, "cold_start")
+  expect_true(is.na(res$manifest$tarballs_error))
+  on_disk <- jsonlite::read_json(file.path(out, "manifest.json"))
+  expect_true("tarballs_error" %in% names(on_disk))
+  expect_null(on_disk$tarballs_error)
+
+  # One current file is below a floor of two: carried, but nothing failed.
+  expect_no_message(
+    small <- run_update(make_stub_io(), out, force_full = TRUE, min_current = 2L, min_archive = 0L))
+  expect_equal(small$manifest$tarballs_state, "carried")
+  expect_true(is.na(small$manifest$tarballs_error))
+  expect_null(jsonlite::read_json(file.path(out, "manifest.json"))$tarballs_error)
+})
+
+test_that("run_update: an unreadable prior table writes none and marks the database partial", {
+  tmp <- withr::local_tempdir(); out <- file.path(tmp, "out")
+  io <- make_stub_io()
+  io$prev_tarballs <- function() stop("database disk image is malformed")
+  res <- run_update(io, out, force_full = TRUE, min_current = 0L, min_archive = 0L,
+                    live_floor = 0L, archive_floor = 0L)
+  expect_null(.read_tarballs(out))
+  expect_equal(res$manifest$tarballs_state, "unreachable")
+  expect_true(res$manifest$names_healthy)
+  expect_false(res$manifest$complete)
+  on_disk <- jsonlite::read_json(file.path(out, "manifest.json"))
+  expect_null(on_disk$n_tarballs)
+  expect_null(on_disk$tarballs_error)
+})
+
+test_that("run_update: an unreachable prior database skips cran_tarballs as well", {
+  tmp <- withr::local_tempdir(); out <- file.path(tmp, "out")
+  io <- make_stub_io()
+  io$prev_names <- function() stop("prior release unreachable")
+  res <- run_update(io, out, force_full = TRUE, min_current = 0L, min_archive = 0L)
+  expect_null(.read_tarballs(out))
+  expect_equal(res$manifest$tarballs_state, "skipped")
+  expect_null(jsonlite::read_json(file.path(out, "manifest.json"))$tarballs_error)
 })
