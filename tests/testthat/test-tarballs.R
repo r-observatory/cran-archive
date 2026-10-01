@@ -217,6 +217,48 @@ test_that("brand-new versions never count toward a storm", {
   expect_equal(got$new_revisions, 3L)
 })
 
+# --- the same file twice in one snapshot ---------------------------------------
+
+test_that("a file listed twice in one snapshot is one revision, with the MD5 either row gives", {
+  twice <- rbind(
+    .one("cli", "3.6.6", 644134, "2026-04-09T09:50:29Z", "current"),
+    .one("cli", "3.6.6", 644134, "2026-04-09T09:50:29Z", "current", "eedc08ba864ae6cd640b05eff1a607ee"))
+  got <- merge_tarballs(empty_tarballs(), twice, "2026-10-01", storm_max = 500L)
+  expect_equal(nrow(got$table), 1L)
+  expect_equal(got$table$revision, 1L)
+  expect_equal(got$table$md5sum, "eedc08ba864ae6cd640b05eff1a607ee")
+  expect_equal(got$new_revisions, 1L)
+})
+
+test_that("a re-upload listed twice opens revision 2 only and counts once toward a storm", {
+  day1 <- merge_tarballs(empty_tarballs(),
+    .one("lmeInfo", "0.3.2", 65124, "2023-04-17T08:30:07Z", "current"),
+    "2026-09-20", storm_max = 500L)$table
+  new <- .one("lmeInfo", "0.3.2", 65532, "2026-09-27T15:46:29Z", "current",
+              "2f85a1705379f8a2bb36d119a9ad90d5")
+  snap2 <- rbind(.one("lmeInfo", "0.3.2", 65124, "2023-04-17T08:30:07Z", "archive"), new, new)
+  got <- merge_tarballs(day1, snap2, "2026-09-28", storm_max = 1L)
+  expect_equal(got$state, "updated")
+  expect_equal(got$new_revisions, 1L)
+  expect_equal(got$table$revision, c(1L, 2L))
+  expect_equal(got$table$size_bytes, c(65124L, 65532L))
+})
+
+test_that("a file given as both archive and current in one snapshot is kept as current", {
+  both <- rbind(
+    .one("cli", "3.6.6", 644134, "2026-04-09T09:50:29Z", "archive"),
+    .one("cli", "3.6.6", 644134, "2026-04-09T09:50:29Z", "current", "eedc08ba864ae6cd640b05eff1a607ee"))
+  day1 <- merge_tarballs(empty_tarballs(), both, "2026-10-01", storm_max = 500L)$table
+  expect_equal(nrow(day1), 1L)
+  expect_equal(day1$listing, "current")
+  expect_equal(day1$md5sum, "eedc08ba864ae6cd640b05eff1a607ee")
+  # The same holds for a file the table already has.
+  day2 <- merge_tarballs(day1, both, "2026-10-02", storm_max = 500L)
+  expect_equal(day2$new_revisions, 0L)
+  expect_equal(day2$table$listing, "current")
+  expect_equal(day2$table$last_seen, "2026-10-02")
+})
+
 # --- the table on disk ---------------------------------------------------------
 
 test_that("export_tarballs writes the keyed, WITHOUT ROWID table with its check", {

@@ -916,9 +916,10 @@ tarball_snapshot_healthy <- function(snapshot, min_current = CURRENT_PKGS_FLOOR,
 #' the MD5 is an attribute. A known file advances last_seen, takes today's
 #' listing and, when PACKAGES gives one, today's MD5 (filling a NULL or
 #' replacing a stale one). An unknown file opens revision max + 1, numbered by
-#' mtime when several arrive at once. A stored file not listed today becomes
-#' 'gone' with last_seen frozen. More than storm_max new files for versions
-#' already recorded returns the prior table unchanged with state "storm".
+#' mtime when several arrive at once. A file in the snapshot more than once is
+#' taken once. A stored file not listed today becomes 'gone' with last_seen
+#' frozen. More than storm_max new files for versions already recorded returns
+#' the prior table unchanged with state "storm".
 #'
 #' @return list(table, state = "cold_start" | "updated" | "storm", new_revisions)
 merge_tarballs <- function(prior, snapshot, today, storm_max = TARBALL_REVISION_STORM_MAX) {
@@ -930,6 +931,12 @@ merge_tarballs <- function(prior, snapshot, today, storm_max = TARBALL_REVISION_
 
   file_key <- function(d) paste(d$package, d$version, sprintf("%d", d$size_bytes), d$mtime, sep = "\t")
   pv_key   <- function(d) paste(d$package, d$version, sep = "\t")
+
+  # One row per file, or a file listed twice would open two revisions. The
+  # current row wins, then a row with an MD5.
+  snapshot <- snapshot[order(snapshot$listing != "current", is.na(snapshot$md5sum)), , drop = FALSE]
+  snapshot <- snapshot[!duplicated(file_key(snapshot)), , drop = FALSE]
+
   pk <- file_key(prior)
   sk <- file_key(snapshot)
 
