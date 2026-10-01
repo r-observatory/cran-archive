@@ -49,7 +49,7 @@ how many events of each action occur across all packages.
 
 `mtime` is the upload time. `first_seen` and `last_seen` only say when this pipeline saw the file, and the first run recorded every file with that day's date.
 
-The table carries forward from the previous release. If that release cannot be read, nothing is published. If the current index fails or lists fewer than 15,000 files, or more than 500 new files appear for versions already recorded, the previous table is kept as it was, `tarballs_state` in `manifest.json` says why, and the run fails after publishing so that someone looks.
+The table carries forward from the previous release. If that release cannot be read, nothing is published. If the current index fails or lists fewer than 15,000 files, or more than 500 new files appear for versions already recorded, the previous table is kept as it was, `tarballs_state` in `manifest.json` says why, and the run fails after publishing so that someone looks. When building the day's file list stops with an error, the error text is printed in the run log and stored as `tarballs_error` in `manifest.json`.
 
 ## Output
 
@@ -74,7 +74,7 @@ The table carries forward from the previous release. If that release cannot be r
 - `cran_tarballs` - one row per source tarball file: `package`, `version`, `revision`, `size_bytes`, `mtime` (UTC), `md5sum`, `listing` (`current`, `archive` or `gone`), `first_seen` and `last_seen`, keyed by `(package, version, revision)`.
 
 A `manifest.json` accompanies the database and carries a `changed` flag so
-downstream consumers can skip unchanged rebuilds, plus `n_tarballs`, `tarball_revisions_new` and `tarballs_state` (`cold_start`, `updated`, `carried`, `storm`, `unreachable` or `skipped`).
+downstream consumers can skip unchanged rebuilds, plus `n_tarballs`, `tarball_revisions_new`, `tarballs_state` (`cold_start`, `updated`, `carried`, `storm`, `unreachable` or `skipped`) and `tarballs_error` (null unless building the day's file list stopped with an error).
 
 ## Running
 

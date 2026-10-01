@@ -1025,20 +1025,28 @@ read_prev_tarballs <- function(db_path) {
 #' States: "cold_start" and "updated" wrote the merged table; "carried" (the
 #' current index failed or came back too small) and "storm" wrote the prior
 #' table back unchanged; "unreachable" (the prior table could not be read)
-#' wrote nothing, and that database must not be published.
-#' @return list(state, n_tarballs, revisions_new)
+#' wrote nothing, and that database must not be published. When building the
+#' snapshot throws, the state is "carried" and the error text is logged and
+#' returned as error, which is NA otherwise.
+#' @return list(state, n_tarballs, revisions_new, error)
 update_tarballs <- function(io, db_path, archive_list, today,
                             min_current = CURRENT_PKGS_FLOOR,
                             min_archive = ARCHIVE_LIST_FLOOR,
                             storm_max = TARBALL_REVISION_STORM_MAX) {
   prior <- tryCatch(io$prev_tarballs(), error = function(e) NULL)
   if (is.null(prior)) {
-    return(list(state = "unreachable", n_tarballs = NA, revisions_new = NA))
+    return(list(state = "unreachable", n_tarballs = NA, revisions_new = NA,
+                error = NA_character_))
   }
+  snap_error <- NA_character_
   snapshot <- tryCatch(
     build_tarball_snapshot(archive_list, io$current_rds(),
                            tryCatch(io$packages_md5(), error = function(e) NULL)),
-    error = function(e) NULL)
+    error = function(e) {
+      snap_error <<- conditionMessage(e)
+      message("cran_tarballs snapshot failed: ", snap_error)
+      NULL
+    })
   merged <- if (tarball_snapshot_healthy(snapshot, min_current, min_archive)) {
     merge_tarballs(prior, snapshot, today, storm_max)
   } else {
@@ -1047,7 +1055,7 @@ update_tarballs <- function(io, db_path, archive_list, today,
   con <- RSQLite::dbConnect(RSQLite::SQLite(), db_path)
   tryCatch(export_tarballs(con, merged$table), finally = RSQLite::dbDisconnect(con))
   list(state = merged$state, n_tarballs = nrow(merged$table),
-       revisions_new = as.integer(merged$new_revisions))
+       revisions_new = as.integer(merged$new_revisions), error = snap_error)
 }
 
 #' Default IO providers: real network fetchers for production use.

@@ -135,7 +135,7 @@ run_update <- function(io, out_dir, force_full = FALSE,
   tarballs <- if (names_healthy) {
     update_tarballs(io, db_path, archive_list, now_stamp, min_current, min_archive)
   } else {
-    list(state = "skipped", n_tarballs = NA, revisions_new = NA)
+    list(state = "skipped", n_tarballs = NA, revisions_new = NA, error = NA_character_)
   }
 
   # 6. Integrity / completeness core over the finalized DB FILE. Every
@@ -172,6 +172,7 @@ run_update <- function(io, out_dir, force_full = FALSE,
       n_tarballs            = tarballs$n_tarballs,
       tarball_revisions_new = tarballs$revisions_new,
       tarballs_state        = tarballs$state,
+      tarballs_error        = tarballs$error,
       source              = list(
         archive_fingerprint = archive_fingerprint
       )

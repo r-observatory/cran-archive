@@ -407,10 +407,42 @@ test_that("run_update: a failed current index writes the prior table back unchan
   prior <- .read_tarballs(out)
   io <- make_stub_io(prev_tarballs = prior)
   io$current_rds <- function() stop("HTTP 503")
-  res <- run_update(io, out, force_full = TRUE, min_current = 0L, min_archive = 0L)
+  res <- suppressMessages(
+    run_update(io, out, force_full = TRUE, min_current = 0L, min_archive = 0L))
   expect_equal(res$manifest$tarballs_state, "carried")
   expect_equal(res$manifest$tarball_revisions_new, 0L)
   expect_equal(.read_tarballs(out), prior)
+})
+
+test_that("run_update: a snapshot that fails shows its error in the run output and the manifest", {
+  tmp <- withr::local_tempdir(); out <- file.path(tmp, "out")
+  io <- make_stub_io()
+  io$current_rds <- function() stop("HTTP 503")
+  expect_message(
+    res <- run_update(io, out, force_full = TRUE, min_current = 0L, min_archive = 0L),
+    "cran_tarballs snapshot failed: HTTP 503", fixed = TRUE)
+  expect_equal(res$manifest$tarballs_state, "carried")
+  expect_equal(res$manifest$tarballs_error, "HTTP 503")
+  on_disk <- jsonlite::read_json(file.path(out, "manifest.json"))
+  expect_equal(on_disk$tarballs_state, "carried")
+  expect_equal(on_disk$tarballs_error, "HTTP 503")
+})
+
+test_that("run_update: a snapshot that builds has no tarballs_error, whether merged or too small", {
+  tmp <- withr::local_tempdir(); out <- file.path(tmp, "out")
+  res <- run_update(make_stub_io(), out, force_full = TRUE, min_current = 0L, min_archive = 0L)
+  expect_equal(res$manifest$tarballs_state, "cold_start")
+  expect_true(is.na(res$manifest$tarballs_error))
+  on_disk <- jsonlite::read_json(file.path(out, "manifest.json"))
+  expect_true("tarballs_error" %in% names(on_disk))
+  expect_null(on_disk$tarballs_error)
+
+  # One current file is below a floor of two: carried, but nothing failed.
+  expect_no_message(
+    small <- run_update(make_stub_io(), out, force_full = TRUE, min_current = 2L, min_archive = 0L))
+  expect_equal(small$manifest$tarballs_state, "carried")
+  expect_true(is.na(small$manifest$tarballs_error))
+  expect_null(jsonlite::read_json(file.path(out, "manifest.json"))$tarballs_error)
 })
 
 test_that("run_update: an unreadable prior table writes none and marks the database partial", {
@@ -425,6 +457,7 @@ test_that("run_update: an unreadable prior table writes none and marks the datab
   expect_false(res$manifest$complete)
   on_disk <- jsonlite::read_json(file.path(out, "manifest.json"))
   expect_null(on_disk$n_tarballs)
+  expect_null(on_disk$tarballs_error)
 })
 
 test_that("run_update: an unreachable prior database skips cran_tarballs as well", {
@@ -434,4 +467,5 @@ test_that("run_update: an unreachable prior database skips cran_tarballs as well
   res <- run_update(io, out, force_full = TRUE, min_current = 0L, min_archive = 0L)
   expect_null(.read_tarballs(out))
   expect_equal(res$manifest$tarballs_state, "skipped")
+  expect_null(jsonlite::read_json(file.path(out, "manifest.json"))$tarballs_error)
 })
