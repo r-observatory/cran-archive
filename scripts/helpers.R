@@ -832,6 +832,84 @@ packages_md5_from <- function(ap, contriburl) {
              md5sum  = md5, stringsAsFactors = FALSE)
 }
 
+# ---------------------------------------------------------------------------
+# cran_tarballs: exact size, mtime and MD5 of every CRAN source tarball
+# ---------------------------------------------------------------------------
+
+TARBALL_COLS <- c("package", "version", "revision", "size_bytes", "mtime",
+                  "md5sum", "listing", "first_seen", "last_seen")
+
+#' A zero-row cran_tarballs frame.
+empty_tarballs <- function() {
+  data.frame(package = character(0), version = character(0), revision = integer(0),
+             size_bytes = integer(0), mtime = character(0), md5sum = character(0),
+             listing = character(0), first_seen = character(0),
+             last_seen = character(0), stringsAsFactors = FALSE)
+}
+
+#' One row per source tarball in today's indexes: package, version, size_bytes
+#' (integer bytes), mtime (UTC, whole seconds), md5sum and listing.
+#'
+#' archive_list is Meta/archive.rds (package -> file.info frame keyed by
+#' "<pkg>/<pkg>_<ver>.tar.gz"); paths of any other shape, such as
+#' "calibFit/Ancestry/calib_2.0.1.tar.gz" or "relax/Old/relax_1.00.tar.gz",
+#' are skipped. current_df is Meta/current.rds (keyed "<pkg>_<ver>.tar.gz").
+#' md5_df is packages_md5_from() or NULL; the MD5 goes on current files only.
+#' A file in both indexes at once is kept once, as current.
+build_tarball_snapshot <- function(archive_list, current_df, md5_df) {
+  n     <- vapply(archive_list, NROW, integer(1))
+  pkg   <- rep(names(archive_list), n)
+  path  <- as.character(unlist(lapply(archive_list, rownames), use.names = FALSE))
+  size  <- as.numeric(unlist(lapply(archive_list, function(d) d$size), use.names = FALSE))
+  mt    <- as.numeric(unlist(lapply(archive_list, function(d) as.numeric(d$mtime)),
+                             use.names = FALSE))
+  prefix <- paste0(pkg, "/", pkg, "_")
+  ver    <- substr(path, nchar(prefix) + 1L, nchar(path) - 7L)
+  keep   <- startsWith(path, prefix) & endsWith(path, ".tar.gz") &
+            nzchar(ver) & !grepl("/", ver, fixed = TRUE)
+
+  files <- rownames(current_df) %||% character(0)
+  m     <- regmatches(files, regexec("^([^_/]+)_([^_/]+)\\.tar\\.gz$", files))
+  ok    <- lengths(m) == 3L
+
+  snap <- data.frame(
+    package    = c(pkg[keep], vapply(m[ok], `[`, "", 2L)),
+    version    = c(ver[keep], vapply(m[ok], `[`, "", 3L)),
+    size       = c(size[keep], as.numeric(current_df$size)[ok]),
+    mt         = c(mt[keep], as.numeric(current_df$mtime)[ok]),
+    listing    = c(rep("archive", sum(keep)), rep("current", sum(ok))),
+    stringsAsFactors = FALSE)
+  snap <- snap[!is.na(snap$size) & !is.na(snap$mt), , drop = FALSE]
+  snap$size_bytes <- as.integer(round(snap$size))
+  snap$mtime      <- format(.POSIXct(snap$mt, tz = "UTC"), "%Y-%m-%dT%H:%M:%SZ", tz = "UTC")
+
+  # A file caught in both listings mid-move counts once, as current.
+  snap <- snap[order(snap$listing != "current"), , drop = FALSE]
+  dup  <- duplicated(paste(snap$package, snap$version, snap$size_bytes, snap$mtime, sep = "\t"))
+  snap <- snap[!dup, , drop = FALSE]
+
+  if (is.null(md5_df)) md5_df <- data.frame(package = character(0), version = character(0),
+                                            md5sum = character(0), stringsAsFactors = FALSE)
+  hit <- match(paste(snap$package, snap$version, sep = "\t"),
+               paste(md5_df$package, md5_df$version, sep = "\t"))
+  snap$md5sum <- as.character(ifelse(snap$listing == "current", md5_df$md5sum[hit], NA_character_))
+
+  snap <- snap[order(snap$package, snap$version, snap$mtime),
+               c("package", "version", "size_bytes", "mtime", "md5sum", "listing"), drop = FALSE]
+  rownames(snap) <- NULL
+  snap
+}
+
+#' Whether a snapshot is complete enough to fold in: at least min_current
+#' current files and min_archive archived packages. A failed read (NULL) never is.
+tarball_snapshot_healthy <- function(snapshot, min_current = CURRENT_PKGS_FLOOR,
+                                     min_archive = ARCHIVE_LIST_FLOOR) {
+  if (!is.data.frame(snapshot)) return(FALSE)
+  n_current <- sum(snapshot$listing == "current")
+  n_archive <- length(unique(snapshot$package[snapshot$listing == "archive"]))
+  n_current >= min_current && n_archive >= min_archive
+}
+
 #' Default IO providers: real network fetchers for production use.
 #'
 #' Returns a named list of zero-argument functions:
