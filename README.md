@@ -5,9 +5,7 @@ listing (archived), together with accurate dates and reasons. The live CRAN
 package index does not retain removed packages, so this fills that gap using
 CRAN's own archive.
 
-It reads CRAN's archive index (`src/contrib/Meta/archive.rds`), the current list
-of available packages, and CRAN's `PACKAGES.in` annotations. A package is treated
-as archived when it appears in the archive but is no longer available on CRAN.
+It reads CRAN's archive index (`src/contrib/Meta/archive.rds`), its index of current tarballs (`src/contrib/Meta/current.rds`), the list of available packages (`src/contrib/PACKAGES.rds`), all three from cran.r-project.org, and CRAN's `PACKAGES.in` annotations. A package is treated as archived when it appears in the archive but is no longer available on CRAN. The available list is read with only the duplicates filter, so a package that declares `OS_type: windows`, or that needs a newer R than the runner, still counts as available.
 For each archived package it records when it first appeared, when and why it was
 archived, and its last version. The aggregated data is written to a SQLite
 database and published to the `r-observatory/cran-archive` GitHub repository for
@@ -45,6 +43,14 @@ unarchival, unorphaning, restoration and reinstatement), `orphaned`, `removed`,
 `replaced` event. `cran_archive_action_counts` is a small companion histogram of
 how many events of each action occur across all packages.
 
+## Source tarballs
+
+`cran_tarballs` records the exact size in bytes and the modification time of every source tarball CRAN lists, from `Meta/current.rds` and `Meta/archive.rds`, with the MD5 sum from `PACKAGES.rds` while the file is current. A file is identified by its size and mtime within its package version. When CRAN replaces the file of a version already released, the new file becomes the next `revision` and the old row stays, marked `gone` once CRAN no longer lists it. A file that moves from the current listing to the archive keeps its revision and its MD5. The MD5 is filled in, or corrected, whenever `PACKAGES.rds` gives it, so the seconds by which that index trails `current.rds` never create a revision. Copies CRAN keeps under a package's `Ancestry/` or `Old/` folder are not recorded.
+
+`mtime` is the upload time. `first_seen` and `last_seen` only say when this pipeline saw the file, and the first run recorded every file with that day's date.
+
+The table carries forward from the previous release. If that release cannot be read, nothing is published. If the current index fails or lists fewer than 15,000 files, or more than 500 new files appear for versions already recorded, the previous table is kept as it was, `tarballs_state` in `manifest.json` says why, and the run fails after publishing so that someone looks.
+
 ## Output
 
 `cran-archive.db` (published on the rolling `current` release) contains:
@@ -65,9 +71,10 @@ how many events of each action occur across all packages.
   `replaced`), and `reason`, keyed by `(package, seq)`.
 - `cran_archive_action_counts` - a histogram of the lineage: one row per
   `action` with its total count `n` across all packages.
+- `cran_tarballs` - one row per source tarball file: `package`, `version`, `revision`, `size_bytes`, `mtime` (UTC), `md5sum`, `listing` (`current`, `archive` or `gone`), `first_seen` and `last_seen`, keyed by `(package, version, revision)`.
 
 A `manifest.json` accompanies the database and carries a `changed` flag so
-downstream consumers can skip unchanged rebuilds.
+downstream consumers can skip unchanged rebuilds, plus `n_tarballs`, `tarball_revisions_new` and `tarballs_state` (`cold_start`, `updated`, `carried`, `storm`, `unreachable` or `skipped`).
 
 ## Running
 
