@@ -808,11 +808,35 @@ build_archive_lineage <- function(dcf) {
   out[order(out$package, out$seq), , drop = FALSE]
 }
 
+# ---------------------------------------------------------------------------
+# The live CRAN list
+# ---------------------------------------------------------------------------
+
+#' CRAN's PACKAGES index as available.packages() reads it, with only the
+#' duplicates filter. The default filters would drop OS_type: windows packages
+#' and any package needing a newer R than this runner, which would mark live
+#' packages as archived. A Recommended package listed twice keeps one row.
+cran_available <- function(repos) {
+  utils::available.packages(repos = repos, type = "source", filters = "duplicates")
+}
+
+#' Package, version and MD5sum from the main-tree rows of an
+#' available.packages() matrix (not the Path: <R version>/Recommended copies).
+#' An empty MD5sum is NA.
+packages_md5_from <- function(ap, contriburl) {
+  main <- sub("/+$", "", ap[, "Repository"]) == sub("/+$", "", contriburl)
+  md5  <- unname(ap[main, "MD5sum"])
+  md5[!is.na(md5) & !nzchar(md5)] <- NA_character_
+  data.frame(package = unname(ap[main, "Package"]),
+             version = unname(ap[main, "Version"]),
+             md5sum  = md5, stringsAsFactors = FALSE)
+}
+
 #' Default IO providers: real network fetchers for production use.
 #'
 #' Returns a named list of zero-argument functions:
 #'   archive_rds()      -- downloads and returns the CRAN archive.rds named list.
-#'   current_packages() -- returns a character vector of currently-available packages.
+#'   current_packages() -- the live CRAN package names, from cran_available().
 #'   removal_reasons()  -- fetches PACKAGES.in and returns a named character vector
 #'                         mapping package name -> X-CRAN-Comment value.
 #'   removal_history()  -- fetches PACKAGES.in (cached with removal_reasons() in the
@@ -825,15 +849,21 @@ build_archive_lineage <- function(dcf) {
 #'                         throws when the prior release is unreachable).
 default_io <- function() {
   .pin <- NULL
+  .ap  <- NULL
   packages_in <- function() {
     if (is.null(.pin)) {
       .pin <<- paste(readLines(url(CRAN_PACKAGES_IN_URL), warn = FALSE), collapse = "\n")
     }
     .pin
   }
+  # One PACKAGES read per run, shared by every reader of it.
+  available <- function() {
+    if (is.null(.ap)) .ap <<- cran_available(CRAN_PACKAGES_URL)
+    .ap
+  }
   list(
     archive_rds      = function() readRDS(url(CRAN_ARCHIVE_URL)),
-    current_packages = function() rownames(available.packages(repos = CRAN_PACKAGES_URL)),
+    current_packages = function() rownames(available()),
     removal_reasons  = function() parse_packages_in(packages_in()),
     removal_history  = function() parse_packages_history(packages_in()),
     packages_dcf     = function() read.dcf(textConnection(packages_in())),
