@@ -989,6 +989,19 @@ export_tarballs <- function(con, df) {
   invisible(nrow(df))
 }
 
+#' cran_names_all from a downloaded prior database, or zero rows when that
+#' database never had the table (the genuine cold start).
+read_prev_names <- function(db_path) {
+  con <- RSQLite::dbConnect(RSQLite::SQLite(), db_path)
+  on.exit(RSQLite::dbDisconnect(con), add = TRUE)
+  if (!RSQLite::dbExistsTable(con, "cran_names_all")) {
+    return(data.frame(name_lower = character(0), canonical_name = character(0),
+                      identity_state = character(0), first_seen = character(0),
+                      last_seen = character(0), stringsAsFactors = FALSE))
+  }
+  RSQLite::dbGetQuery(con, "SELECT * FROM cran_names_all")
+}
+
 #' cran_tarballs from a downloaded prior database, or zero rows when that
 #' database never had the table (the first run then numbers every file).
 #' Throws when the file cannot be read, which the caller treats as unreachable.
@@ -998,6 +1011,36 @@ read_prev_tarballs <- function(db_path) {
   if (!RSQLite::dbExistsTable(con, "cran_tarballs")) return(empty_tarballs())
   RSQLite::dbGetQuery(con, paste("SELECT", paste(TARBALL_COLS, collapse = ", "),
                                  "FROM cran_tarballs"))
+}
+
+#' Build and write cran_tarballs for one run into the database at db_path.
+#'
+#' States: "cold_start" and "updated" wrote the merged table; "carried" (the
+#' current index failed or came back too small) and "storm" wrote the prior
+#' table back unchanged; "unreachable" (the prior table could not be read)
+#' wrote nothing, and that database must not be published.
+#' @return list(state, n_tarballs, revisions_new)
+update_tarballs <- function(io, db_path, archive_list, today,
+                            min_current = CURRENT_PKGS_FLOOR,
+                            min_archive = ARCHIVE_LIST_FLOOR,
+                            storm_max = TARBALL_REVISION_STORM_MAX) {
+  prior <- tryCatch(io$prev_tarballs(), error = function(e) NULL)
+  if (is.null(prior)) {
+    return(list(state = "unreachable", n_tarballs = NA, revisions_new = NA))
+  }
+  snapshot <- tryCatch(
+    build_tarball_snapshot(archive_list, io$current_rds(),
+                           tryCatch(io$packages_md5(), error = function(e) NULL)),
+    error = function(e) NULL)
+  merged <- if (tarball_snapshot_healthy(snapshot, min_current, min_archive)) {
+    merge_tarballs(prior, snapshot, today, storm_max)
+  } else {
+    list(table = prior, state = "carried", new_revisions = 0L)
+  }
+  con <- RSQLite::dbConnect(RSQLite::SQLite(), db_path)
+  tryCatch(export_tarballs(con, merged$table), finally = RSQLite::dbDisconnect(con))
+  list(state = merged$state, n_tarballs = nrow(merged$table),
+       revisions_new = as.integer(merged$new_revisions))
 }
 
 #' Default IO providers: real network fetchers for production use.
@@ -1012,12 +1055,17 @@ read_prev_tarballs <- function(db_path) {
 #'                         episodes, package -> list of episodes.
 #'   packages_dcf()     -- fetches PACKAGES.in (same cache) and returns it parsed as
 #'                         a read.dcf() character matrix for the event lineage.
-#'   prev_names()       -- downloads the prior published database and returns its
-#'                         cran_names_all table (0-row on a genuine cold start;
-#'                         throws when the prior release is unreachable).
+#'   packages_md5()     -- package, version and MD5sum of the main-tree PACKAGES rows.
+#'   current_rds()      -- Meta/current.rds: file.info of every current tarball.
+#'   prev_names()       -- the prior published database's cran_names_all table
+#'                         (0-row on a genuine cold start; throws when the prior
+#'                         release is unreachable).
+#'   prev_tarballs()    -- the prior database's cran_tarballs (0-row before the
+#'                         first publish of it; throws when unreachable).
 default_io <- function() {
-  .pin <- NULL
-  .ap  <- NULL
+  .pin  <- NULL
+  .ap   <- NULL
+  .prev <- NULL
   packages_in <- function() {
     if (is.null(.pin)) {
       .pin <<- paste(readLines(url(CRAN_PACKAGES_IN_URL), warn = FALSE), collapse = "\n")
@@ -1029,19 +1077,11 @@ default_io <- function() {
     if (is.null(.ap)) .ap <<- cran_available(CRAN_PACKAGES_URL)
     .ap
   }
-  list(
-    archive_rds      = function() readRDS(url(CRAN_ARCHIVE_URL)),
-    current_packages = function() rownames(available()),
-    removal_reasons  = function() parse_packages_in(packages_in()),
-    removal_history  = function() parse_packages_history(packages_in()),
-    packages_dcf     = function() read.dcf(textConnection(packages_in())),
-
-    prev_names = function() {
-      empty <- data.frame(name_lower = character(0), canonical_name = character(0),
-                          identity_state = character(0), first_seen = character(0),
-                          last_seen = character(0), stringsAsFactors = FALSE)
+  # The prior published database, downloaded once per run for both tables. It
+  # sits under the session temp directory, which R removes on exit.
+  prev_db <- function() {
+    if (is.null(.prev)) {
       tmp <- tempfile(); dir.create(tmp, showWarnings = FALSE)
-      on.exit(unlink(tmp, recursive = TRUE), add = TRUE)
       st <- suppressWarnings(system2("gh",
         c("release", "download", "current", "--repo", PUBLISH_REPO,
           "--pattern", DB_FILENAME, "--dir", tmp, "--clobber"),
@@ -1053,12 +1093,20 @@ default_io <- function() {
       if (!identical(as.integer(st), 0L) || !file.exists(db)) {
         stop("prior release unreachable")
       }
-      con <- RSQLite::dbConnect(RSQLite::SQLite(), db)
-      on.exit(RSQLite::dbDisconnect(con), add = TRUE)
-      # A successful download with no cran_names_all table is the genuine
-      # cold-start case: the table has simply never been published yet.
-      if (!RSQLite::dbExistsTable(con, "cran_names_all")) return(empty)
-      RSQLite::dbGetQuery(con, "SELECT * FROM cran_names_all")
+      .prev <<- db
     }
+    .prev
+  }
+  list(
+    archive_rds      = function() readRDS(url(CRAN_ARCHIVE_URL)),
+    current_packages = function() rownames(available()),
+    packages_md5     = function() packages_md5_from(available(),
+                                    contrib.url(CRAN_PACKAGES_URL, type = "source")),
+    current_rds      = function() readRDS(url(CRAN_CURRENT_URL)),
+    removal_reasons  = function() parse_packages_in(packages_in()),
+    removal_history  = function() parse_packages_history(packages_in()),
+    packages_dcf     = function() read.dcf(textConnection(packages_in())),
+    prev_names       = function() read_prev_names(prev_db()),
+    prev_tarballs    = function() read_prev_tarballs(prev_db())
   )
 }
