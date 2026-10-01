@@ -910,6 +910,96 @@ tarball_snapshot_healthy <- function(snapshot, min_current = CURRENT_PKGS_FLOOR,
   n_current >= min_current && n_archive >= min_archive
 }
 
+#' Fold today's snapshot into the prior cran_tarballs.
+#'
+#' A file is identified by (size_bytes, mtime) within its (package, version);
+#' the MD5 is an attribute. A known file advances last_seen, takes today's
+#' listing and, when PACKAGES gives one, today's MD5 (filling a NULL or
+#' replacing a stale one). An unknown file opens revision max + 1, numbered by
+#' mtime when several arrive at once. A stored file not listed today becomes
+#' 'gone' with last_seen frozen. More than storm_max new files for versions
+#' already recorded returns the prior table unchanged with state "storm".
+#'
+#' @return list(table, state = "cold_start" | "updated" | "storm", new_revisions)
+merge_tarballs <- function(prior, snapshot, today, storm_max = TARBALL_REVISION_STORM_MAX) {
+  if (is.null(prior)) prior <- empty_tarballs()
+  prior <- prior[, TARBALL_COLS, drop = FALSE]
+  prior$revision   <- as.integer(prior$revision)
+  prior$size_bytes <- as.integer(prior$size_bytes)
+  snapshot$size_bytes <- as.integer(snapshot$size_bytes)
+
+  file_key <- function(d) paste(d$package, d$version, sprintf("%d", d$size_bytes), d$mtime, sep = "\t")
+  pv_key   <- function(d) paste(d$package, d$version, sep = "\t")
+  pk <- file_key(prior)
+  sk <- file_key(snapshot)
+
+  out  <- prior
+  hit  <- match(pk, sk)
+  seen <- !is.na(hit)
+  out$last_seen[seen] <- today
+  out$listing[seen]   <- snapshot$listing[hit[seen]]
+  md5 <- snapshot$md5sum[hit[seen]]
+  out$md5sum[seen][!is.na(md5)] <- md5[!is.na(md5)]
+  out$listing[!seen] <- "gone"
+
+  fresh <- snapshot[!(sk %in% pk), , drop = FALSE]
+  fresh <- fresh[order(fresh$package, fresh$version, fresh$mtime), , drop = FALSE]
+  fresh_pv <- pv_key(fresh)
+  known    <- fresh_pv %in% pv_key(prior)
+  if (sum(known) > storm_max) {
+    return(list(table = prior, state = "storm", new_revisions = 0L))
+  }
+  top  <- if (nrow(prior) > 0L) tapply(prior$revision, pv_key(prior), max) else integer(0)
+  base <- ifelse(known, top[fresh_pv], 0L)
+  rank <- ave(seq_along(fresh_pv), fresh_pv, FUN = seq_along)
+  added <- data.frame(
+    package = fresh$package, version = fresh$version,
+    revision = as.integer(base + rank), size_bytes = fresh$size_bytes,
+    mtime = fresh$mtime, md5sum = as.character(fresh$md5sum), listing = fresh$listing,
+    first_seen = rep(today, nrow(fresh)), last_seen = rep(today, nrow(fresh)),
+    stringsAsFactors = FALSE)
+
+  table <- rbind(out, added)
+  table <- table[order(table$package, table$version, table$revision), , drop = FALSE]
+  rownames(table) <- NULL
+  list(table = table,
+       state = if (nrow(prior) == 0L) "cold_start" else "updated",
+       new_revisions = nrow(added))
+}
+
+#' Write cran_tarballs into an open connection, replacing any earlier copy.
+export_tarballs <- function(con, df) {
+  DBI::dbWithTransaction(con, {
+    RSQLite::dbExecute(con, "DROP TABLE IF EXISTS cran_tarballs")
+    RSQLite::dbExecute(con, "
+      CREATE TABLE cran_tarballs (
+        package TEXT NOT NULL, version TEXT NOT NULL,
+        revision INTEGER NOT NULL,   -- 1 for the first file seen, +1 per replacement
+        size_bytes INTEGER NOT NULL,
+        mtime TEXT NOT NULL,         -- UTC ISO-8601
+        md5sum TEXT,                 -- from PACKAGES while current
+        listing TEXT NOT NULL,       -- 'current' | 'archive' | 'gone'
+        first_seen TEXT NOT NULL, last_seen TEXT NOT NULL,
+        PRIMARY KEY (package, version, revision),
+        CHECK (last_seen >= first_seen)) WITHOUT ROWID")
+    if (nrow(df) > 0L) {
+      RSQLite::dbWriteTable(con, "cran_tarballs", df[, TARBALL_COLS, drop = FALSE], append = TRUE)
+    }
+  })
+  invisible(nrow(df))
+}
+
+#' cran_tarballs from a downloaded prior database, or zero rows when that
+#' database never had the table (the first run then numbers every file).
+#' Throws when the file cannot be read, which the caller treats as unreachable.
+read_prev_tarballs <- function(db_path) {
+  con <- RSQLite::dbConnect(RSQLite::SQLite(), db_path)
+  on.exit(RSQLite::dbDisconnect(con), add = TRUE)
+  if (!RSQLite::dbExistsTable(con, "cran_tarballs")) return(empty_tarballs())
+  RSQLite::dbGetQuery(con, paste("SELECT", paste(TARBALL_COLS, collapse = ", "),
+                                 "FROM cran_tarballs"))
+}
+
 #' Default IO providers: real network fetchers for production use.
 #'
 #' Returns a named list of zero-argument functions:
