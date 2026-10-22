@@ -5,7 +5,8 @@
 # packages that are currently archived (in archive.rds but absent from the live
 # CRAN listing), and writes a SQLite catalog plus a JSON manifest to out_dir.
 # It also records the exact size, mtime and MD5 of every source tarball in
-# cran_tarballs, carried forward from the prior published database.
+# cran_tarballs, carried forward from the prior published database, and
+# downloads a share of the files not hashed yet to record their MD5 and SHA-256.
 #
 # run_update(io, out_dir, force_full) takes an injectable io for offline testing.
 # default_io() (in helpers.R) supplies the real network fetchers. min_current and
@@ -51,7 +52,9 @@ run_update <- function(io, out_dir, force_full = FALSE,
                        min_current = CURRENT_PKGS_FLOOR,
                        min_archive = ARCHIVE_LIST_FLOOR,
                        live_floor = CRAN_LIVE_FLOOR,
-                       archive_floor = CRAN_ARCHIVE_FLOOR) {
+                       archive_floor = CRAN_ARCHIVE_FLOOR,
+                       hash_max_files = TARBALL_HASH_MAX_FILES,
+                       hash_deadline = NULL) {
   dir.create(out_dir, showWarnings = FALSE, recursive = TRUE)
 
   # 1. Fetch data sources via injectable io
@@ -138,10 +141,28 @@ run_update <- function(io, out_dir, force_full = FALSE,
     list(state = "skipped", n_tarballs = NA, revisions_new = NA, error = NA_character_)
   }
 
+  # Hash files that have no SHA-256 yet into the table just written, within this
+  # run's budget. Each batch is stored as it finishes.
+  no_hashes <- function(stop) {
+    list(hashed = NA, to_hash = NA, mismatches = NA, failures = NA, stop = stop)
+  }
+  hashes <- if (!is.na(tarballs$n_tarballs) && is.function(io$fetch_tarballs)) {
+    tryCatch(
+      hash_tarballs(db_path, io$fetch_tarballs,
+                    deadline = if (is.null(hash_deadline)) tarball_hash_deadline() else hash_deadline,
+                    max_files = hash_max_files),
+      error = function(e) {
+        message("cran_tarballs hashing stopped: ", conditionMessage(e))
+        no_hashes("error")
+      })
+  } else {
+    no_hashes("skipped")
+  }
+
   # 6. Integrity / completeness core over the finalized DB FILE. Every
-  #    connection to db_path is closed above (export_archive and each names
-  #    write disconnect before returning), so db_bytes/db_sha256 hash the exact
-  #    published bytes.
+  #    connection to db_path is closed above (export_archive, each names write
+  #    and the hashing disconnect before returning), so db_bytes/db_sha256 hash
+  #    the exact published bytes.
   #
   #    complete = full-not-partial: the DB holds the full dataset the merge
   #    consumes. The archive tables are always a full stateless rebuild (a
@@ -173,6 +194,11 @@ run_update <- function(io, out_dir, force_full = FALSE,
       tarball_revisions_new = tarballs$revisions_new,
       tarballs_state        = tarballs$state,
       tarballs_error        = tarballs$error,
+      tarballs_hashed         = hashes$hashed,
+      tarballs_to_hash        = hashes$to_hash,
+      tarball_hash_mismatches = hashes$mismatches,
+      tarball_hash_failures   = hashes$failures,
+      tarball_hash_stop       = hashes$stop,
       source              = list(
         archive_fingerprint = archive_fingerprint
       )

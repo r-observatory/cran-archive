@@ -837,14 +837,16 @@ packages_md5_from <- function(ap, contriburl) {
 # ---------------------------------------------------------------------------
 
 TARBALL_COLS <- c("package", "version", "revision", "size_bytes", "mtime",
-                  "md5sum", "listing", "first_seen", "last_seen")
+                  "md5sum", "listing", "first_seen", "last_seen",
+                  "sha256", "hashed_at")
 
 #' A zero-row cran_tarballs frame.
 empty_tarballs <- function() {
   data.frame(package = character(0), version = character(0), revision = integer(0),
              size_bytes = integer(0), mtime = character(0), md5sum = character(0),
              listing = character(0), first_seen = character(0),
-             last_seen = character(0), stringsAsFactors = FALSE)
+             last_seen = character(0), sha256 = character(0),
+             hashed_at = character(0), stringsAsFactors = FALSE)
 }
 
 #' One row per source tarball in today's indexes: package, version, size_bytes
@@ -915,11 +917,13 @@ tarball_snapshot_healthy <- function(snapshot, min_current = CURRENT_PKGS_FLOOR,
 #' A file is identified by (size_bytes, mtime) within its (package, version);
 #' the MD5 is an attribute. A known file advances last_seen, takes today's
 #' listing and, when PACKAGES gives one, today's MD5 (filling a NULL or
-#' replacing a stale one). An unknown file opens revision max + 1, numbered by
-#' mtime when several arrive at once. A file in the snapshot more than once is
-#' taken once. A stored file not listed today becomes 'gone' with last_seen
-#' frozen. More than storm_max new files for versions already recorded returns
-#' the prior table unchanged with state "storm".
+#' replacing a stale one), unless the file's own bytes were hashed already. Its
+#' sha256 and hashed_at carry over. An unknown file opens revision max + 1,
+#' numbered by mtime when several arrive at once, with no hashes yet. A file in
+#' the snapshot more than once is taken once. A stored file not listed today
+#' becomes 'gone' with last_seen frozen. More than storm_max new files for
+#' versions already recorded returns the prior table unchanged with state
+#' "storm".
 #'
 #' @return list(table, state = "cold_start" | "updated" | "storm", new_revisions)
 merge_tarballs <- function(prior, snapshot, today, storm_max = TARBALL_REVISION_STORM_MAX) {
@@ -945,8 +949,11 @@ merge_tarballs <- function(prior, snapshot, today, storm_max = TARBALL_REVISION_
   seen <- !is.na(hit)
   out$last_seen[seen] <- today
   out$listing[seen]   <- snapshot$listing[hit[seen]]
-  md5 <- snapshot$md5sum[hit[seen]]
-  out$md5sum[seen][!is.na(md5)] <- md5[!is.na(md5)]
+  # A hashed file's MD5 was checked against its bytes, so PACKAGES no longer
+  # changes it.
+  md5  <- snapshot$md5sum[hit[seen]]
+  take <- !is.na(md5) & is.na(out$sha256[seen])
+  out$md5sum[seen][take] <- md5[take]
   out$listing[!seen] <- "gone"
 
   fresh <- snapshot[!(sk %in% pk), , drop = FALSE]
@@ -964,6 +971,7 @@ merge_tarballs <- function(prior, snapshot, today, storm_max = TARBALL_REVISION_
     revision = as.integer(base + rank), size_bytes = fresh$size_bytes,
     mtime = fresh$mtime, md5sum = as.character(fresh$md5sum), listing = fresh$listing,
     first_seen = rep(today, nrow(fresh)), last_seen = rep(today, nrow(fresh)),
+    sha256 = rep(NA_character_, nrow(fresh)), hashed_at = rep(NA_character_, nrow(fresh)),
     stringsAsFactors = FALSE)
 
   table <- rbind(out, added)
@@ -984,9 +992,11 @@ export_tarballs <- function(con, df) {
         revision INTEGER NOT NULL,   -- 1 for the first file seen, +1 per replacement
         size_bytes INTEGER NOT NULL,
         mtime TEXT NOT NULL,         -- UTC ISO-8601
-        md5sum TEXT,                 -- from PACKAGES while current
+        md5sum TEXT,                 -- from PACKAGES while current, else from the bytes
         listing TEXT NOT NULL,       -- 'current' | 'archive' | 'gone'
         first_seen TEXT NOT NULL, last_seen TEXT NOT NULL,
+        sha256 TEXT,                 -- of the downloaded bytes, once verified
+        hashed_at TEXT,              -- UTC ISO-8601
         PRIMARY KEY (package, version, revision),
         CHECK (last_seen >= first_seen)) WITHOUT ROWID")
     if (nrow(df) > 0L) {
@@ -1011,13 +1021,217 @@ read_prev_names <- function(db_path) {
 
 #' cran_tarballs from a downloaded prior database, or zero rows when that
 #' database never had the table (the first run then numbers every file).
+#' A table from before the hash columns gains them first.
 #' Throws when the file cannot be read, which the caller treats as unreachable.
 read_prev_tarballs <- function(db_path) {
   con <- RSQLite::dbConnect(RSQLite::SQLite(), db_path)
   on.exit(RSQLite::dbDisconnect(con), add = TRUE)
   if (!RSQLite::dbExistsTable(con, "cran_tarballs")) return(empty_tarballs())
-  RSQLite::dbGetQuery(con, paste("SELECT", paste(TARBALL_COLS, collapse = ", "),
-                                 "FROM cran_tarballs"))
+  add_tarball_hash_columns(con)
+  out <- RSQLite::dbGetQuery(con, paste("SELECT", paste(TARBALL_COLS, collapse = ", "),
+                                        "FROM cran_tarballs"))
+  # A column that is NULL throughout can come back logical.
+  for (col in c("md5sum", "sha256", "hashed_at")) out[[col]] <- as.character(out[[col]])
+  out
+}
+
+#' Give a cran_tarballs written before the hash columns its sha256 and
+#' hashed_at, by ALTER TABLE: every row stays as it is and the new columns
+#' start NULL. A table that has them is left alone.
+add_tarball_hash_columns <- function(con) {
+  have <- RSQLite::dbGetQuery(con, "PRAGMA table_info(cran_tarballs)")$name
+  added <- setdiff(c("sha256", "hashed_at"), have)
+  for (col in added) {
+    RSQLite::dbExecute(con, sprintf("ALTER TABLE cran_tarballs ADD COLUMN %s TEXT", col))
+  }
+  invisible(added)
+}
+
+# ---------------------------------------------------------------------------
+# Hashing each tarball once
+# ---------------------------------------------------------------------------
+
+#' Where a file is served: src/contrib/<pkg>_<ver>.tar.gz while current,
+#' src/contrib/Archive/<pkg>/<pkg>_<ver>.tar.gz once archived.
+tarball_url <- function(package, version, listing, mirror = TARBALL_MIRROR_URL) {
+  file <- paste0(package, "_", version, ".tar.gz")
+  ifelse(listing == "current",
+         paste0(mirror, "/src/contrib/", file),
+         paste0(mirror, "/src/contrib/Archive/", package, "/", file))
+}
+
+#' The files still to hash, in the order a run takes them: current files, then
+#' archived files of packages still on CRAN, then the rest, newest first within
+#' each. A gone file is left out: its address now serves another file or none.
+tarball_hash_queue <- function(df) {
+  live <- unique(df$package[df$listing == "current"])
+  q <- df[is.na(df$sha256) & df$listing %in% c("current", "archive"), , drop = FALSE]
+  tier <- ifelse(q$listing == "current", 1L, ifelse(q$package %in% live, 2L, 3L))
+  q <- q[order(tier, q$mtime, q$package, q$version, q$revision,
+               decreasing = c(FALSE, TRUE, FALSE, FALSE, FALSE), method = "radix"), , drop = FALSE]
+  rownames(q) <- NULL
+  q
+}
+
+#' When a run stops starting downloads: max_secs after start, or job_secs after
+#' the job started (job_started, epoch seconds as text) when that is sooner.
+tarball_hash_deadline <- function(start = Sys.time(),
+                                  job_started = Sys.getenv("JOB_STARTED_AT"),
+                                  max_secs = TARBALL_HASH_MAX_SECS,
+                                  job_secs = TARBALL_HASH_JOB_SECS) {
+  end <- start + max_secs
+  js  <- suppressWarnings(as.numeric(job_started))
+  if (length(js) == 1L && is.finite(js)) {
+    end <- min(end, .POSIXct(js + job_secs, tz = attr(start, "tzone")))
+  }
+  end
+}
+
+#' Download each url to its destfile, all at once, naming this project in the
+#' User-Agent. TRUE where that file arrived; a failure is FALSE, never an error.
+download_tarballs <- function(urls, destfiles, user_agent = TARBALL_HASH_USER_AGENT,
+                              timeout = TARBALL_HASH_TIMEOUT) {
+  op <- options(HTTPUserAgent = user_agent, timeout = timeout)
+  on.exit(options(op), add = TRUE)
+  st <- tryCatch(
+    suppressWarnings(utils::download.file(urls, destfiles, method = "libcurl",
+                                          mode = "wb", quiet = TRUE)),
+    error = function(e) NULL)
+  if (is.null(st)) return(rep(FALSE, length(urls)))
+  codes <- attr(st, "retvals")
+  if (is.null(codes)) codes <- rep(as.integer(st), length(urls))
+  codes == 0L & file.exists(destfiles)
+}
+
+#' Fetch one batch, retrying what did not arrive, and hash what verifies.
+#' Returns one row per file: md5 and sha256 (NA unless verified) and problem
+#' (NA, "mismatch" or "failure"). Each problem is logged.
+hash_tarball_batch <- function(rows, fetch, dir, attempts, deadline, clock, pause,
+                               mirror, backoff = TARBALL_HASH_BACKOFF) {
+  n    <- nrow(rows)
+  urls <- tarball_url(rows$package, rows$version, rows$listing, mirror)
+  dest <- file.path(dir, sprintf("%d.tar.gz", seq_len(n)))
+  on.exit(unlink(dest), add = TRUE)
+
+  arrived <- rep(FALSE, n)
+  for (a in seq_len(attempts)) {
+    need <- which(!arrived)
+    if (length(need) == 0L) break
+    if (a > 1L) {
+      if (clock() >= deadline) break
+      pause(backoff * 2^(a - 2L))
+    }
+    unlink(dest[need])
+    ok <- tryCatch(as.logical(fetch(urls[need], dest[need])),
+                   error = function(e) rep(FALSE, length(need)))
+    ok <- rep_len(ok, length(need))
+    arrived[need] <- !is.na(ok) & ok & file.exists(dest[need])
+  }
+
+  out <- data.frame(md5 = rep(NA_character_, n), sha256 = rep(NA_character_, n),
+                    problem = rep(NA_character_, n), stringsAsFactors = FALSE)
+  for (i in seq_len(n)) {
+    who <- sprintf("%s %s revision %d (%s)", rows$package[i], rows$version[i],
+                   as.integer(rows$revision[i]), urls[i])
+    if (!arrived[i]) {
+      out$problem[i] <- "failure"
+      message("download failed, nothing stored: ", who)
+      next
+    }
+    size <- file.size(dest[i])
+    if (size != rows$size_bytes[i]) {
+      out$problem[i] <- "mismatch"
+      message(sprintf("mismatch, nothing stored: %s is %.0f bytes, %d expected",
+                      who, size, as.integer(rows$size_bytes[i])))
+      next
+    }
+    md5  <- tolower(unname(tools::md5sum(dest[i])))
+    cran <- rows$md5sum[i]
+    if (!is.na(cran) && nzchar(cran) && md5 != tolower(cran)) {
+      out$problem[i] <- "mismatch"
+      message(sprintf("mismatch, nothing stored: %s has MD5 %s, %s expected", who, md5, cran))
+      next
+    }
+    out$md5[i]    <- md5
+    out$sha256[i] <- file_sha256(dest[i])
+  }
+  out
+}
+
+#' Store verified hashes. The MD5 goes in only where the row had none.
+store_tarball_hashes <- function(con, rows, md5, sha256, stamp) {
+  DBI::dbWithTransaction(con, {
+    RSQLite::dbExecute(con, "
+      UPDATE cran_tarballs
+         SET sha256 = ?, hashed_at = ?, md5sum = COALESCE(NULLIF(md5sum, ''), ?)
+       WHERE package = ? AND version = ? AND revision = ? AND sha256 IS NULL",
+      params = list(sha256, rep(stamp, length(sha256)), md5,
+                    rows$package, rows$version, as.integer(rows$revision)))
+  })
+  invisible(length(sha256))
+}
+
+#' Download every listed cran_tarballs file that has no sha256 yet, at most
+#' max_files of them, starting none after deadline, `batch` at a time, and
+#' store each one's MD5 and SHA-256 in the database at db_path once its size,
+#' and CRAN's MD5 where the row has one, match. Each batch is stored as it
+#' finishes, so a run that stops early keeps what it hashed. A file that does
+#' not verify stores nothing and waits for a later run.
+#'
+#' @param fetch function(urls, destfiles) returning TRUE where a file arrived.
+#' @return list(hashed, to_hash, mismatches, failures, stop), where stop is
+#'   "done", "count" (max_files reached), "time" (deadline reached) or "error".
+hash_tarballs <- function(db_path, fetch, deadline,
+                          max_files = TARBALL_HASH_MAX_FILES,
+                          batch = TARBALL_HASH_CONCURRENCY,
+                          attempts = TARBALL_HASH_ATTEMPTS,
+                          mirror = TARBALL_MIRROR_URL,
+                          clock = Sys.time, pause = Sys.sleep) {
+  started <- clock()
+  con <- RSQLite::dbConnect(RSQLite::SQLite(), db_path)
+  on.exit(RSQLite::dbDisconnect(con), add = TRUE)
+  queue <- tarball_hash_queue(RSQLite::dbGetQuery(con,
+    "SELECT package, version, revision, size_bytes, mtime, md5sum, listing, sha256
+       FROM cran_tarballs"))
+  todo <- queue[seq_len(min(nrow(queue), max_files)), , drop = FALSE]
+  dir <- tempfile("tarballs-")
+  dir.create(dir)
+  on.exit(unlink(dir, recursive = TRUE), add = TRUE)
+
+  hashed <- 0L; mismatches <- 0L; failures <- 0L
+  stopped <- if (nrow(todo) < nrow(queue)) "count" else "done"
+  for (s in seq(1L, by = batch, length.out = ceiling(nrow(todo) / batch))) {
+    if (clock() >= deadline) {
+      stopped <- "time"
+      break
+    }
+    rows <- todo[s:min(s + batch - 1L, nrow(todo)), , drop = FALSE]
+    err <- tryCatch({
+      res <- hash_tarball_batch(rows, fetch, dir, attempts, deadline, clock, pause, mirror)
+      ok  <- !is.na(res$sha256)
+      if (any(ok)) {
+        store_tarball_hashes(con, rows[ok, , drop = FALSE], res$md5[ok], res$sha256[ok],
+                             format(clock(), "%Y-%m-%dT%H:%M:%SZ", tz = "UTC"))
+      }
+      hashed     <- hashed + sum(ok)
+      mismatches <- mismatches + sum(res$problem %in% "mismatch")
+      failures   <- failures + sum(res$problem %in% "failure")
+      NULL
+    }, error = function(e) conditionMessage(e))
+    if (!is.null(err)) {
+      message("cran_tarballs hashing stopped: ", err)
+      stopped <- "error"
+      break
+    }
+  }
+
+  to_hash <- nrow(queue) - hashed
+  message(sprintf(paste("cran_tarballs hashes: %d hashed this run, %d still to hash,",
+                        "%d mismatches, %d failed downloads, in %.0f s (stopped: %s)"),
+                  hashed, to_hash, mismatches, failures,
+                  as.numeric(difftime(clock(), started, units = "secs")), stopped))
+  list(hashed = hashed, to_hash = to_hash, mismatches = mismatches,
+       failures = failures, stop = stopped)
 }
 
 #' Build and write cran_tarballs for one run into the database at db_path.
@@ -1077,6 +1291,8 @@ update_tarballs <- function(io, db_path, archive_list, today,
 #'                         release is unreachable).
 #'   prev_tarballs()    -- the prior database's cran_tarballs (0-row before the
 #'                         first publish of it; throws when unreachable).
+#'   fetch_tarballs(urls, destfiles) -- downloads tarballs from the mirror,
+#'                         TRUE where a file arrived.
 default_io <- function() {
   .pin  <- NULL
   .ap   <- NULL
@@ -1105,7 +1321,8 @@ default_io <- function() {
       # A failed download is a transient/network problem, not evidence that no
       # table has ever been published. Throw so the caller can tell this apart
       # from a genuine cold start and avoid resetting first_seen for everyone.
-      if (!identical(as.integer(st), 0L) || !file.exists(db)) {
+      # An empty file would open as an empty database, so it fails the same way.
+      if (!prior_download_ok(st, db)) {
         stop("prior release unreachable")
       }
       .prev <<- db
@@ -1122,6 +1339,13 @@ default_io <- function() {
     removal_history  = function() parse_packages_history(packages_in()),
     packages_dcf     = function() read.dcf(textConnection(packages_in())),
     prev_names       = function() read_prev_names(prev_db()),
-    prev_tarballs    = function() read_prev_tarballs(prev_db())
+    prev_tarballs    = function() read_prev_tarballs(prev_db()),
+    fetch_tarballs   = download_tarballs
   )
+}
+
+#' Whether the prior database download worked: gh exited 0 and left a file
+#' that is not empty.
+prior_download_ok <- function(status, path) {
+  identical(as.integer(status), 0L) && file.exists(path) && isTRUE(file.size(path) > 0)
 }
