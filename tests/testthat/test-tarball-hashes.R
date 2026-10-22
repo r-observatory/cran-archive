@@ -493,6 +493,7 @@ test_that("the deadline is the time budget, or sooner when the job started long 
 # --- the real download, against local files ------------------------------------
 
 test_that("download_tarballs fetches several files at once and reports each one", {
+  skip_if_not("file" %in% attr(libcurlVersion(), "protocols"), "this libcurl has no file:// support")
   root <- .local_mirror(list("src/contrib/a_1.0.tar.gz" = ABC$text,
                              "src/contrib/b_1.0.tar.gz" = FOX$text))
   out  <- withr::local_tempdir()
