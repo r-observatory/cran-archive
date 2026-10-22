@@ -45,11 +45,15 @@ how many events of each action occur across all packages.
 
 ## Source tarballs
 
-`cran_tarballs` records the exact size in bytes and the modification time of every source tarball CRAN lists, from `Meta/current.rds` and `Meta/archive.rds`, with the MD5 sum from `PACKAGES.rds` while the file is current. A file is identified by its size and mtime within its package version. When CRAN replaces the file of a version already released, the new file becomes the next `revision` and the old row stays, marked `gone` once CRAN no longer lists it. A file that moves from the current listing to the archive keeps its revision and its MD5. The MD5 is filled in, or corrected, whenever `PACKAGES.rds` gives it, so the seconds by which that index trails `current.rds` never create a revision. Copies CRAN keeps under a package's `Ancestry/` or `Old/` folder are not recorded.
+`cran_tarballs` records the exact size in bytes and the modification time of every source tarball CRAN lists, from `Meta/current.rds` and `Meta/archive.rds`, with the MD5 sum from `PACKAGES.rds` while the file is current. A file is identified by its size and mtime within its package version. When CRAN replaces the file of a version already released, the new file becomes the next `revision` and the old row stays, marked `gone` once CRAN no longer lists it. A file that moves from the current listing to the archive keeps its revision and its MD5. The MD5 is filled in, or corrected, whenever `PACKAGES.rds` gives it, until the file's own bytes are hashed, so the seconds by which that index trails `current.rds` never create a revision. Copies CRAN keeps under a package's `Ancestry/` or `Old/` folder are not recorded.
 
 `mtime` is the upload time. `first_seen` and `last_seen` only say when this pipeline saw the file, and the first run recorded every file with that day's date.
 
-The table carries forward from the previous release. If that release cannot be read, nothing is published. If the current index fails or lists fewer than 15,000 files, or more than 500 new files appear for versions already recorded, the previous table is kept as it was, `tarballs_state` in `manifest.json` says why, and the run fails after publishing so that someone looks. When building the day's file list stops with an error, the error text is printed in the run log and stored as `tarballs_error` in `manifest.json`.
+Each file is also downloaded once to record its `sha256`, and its `md5sum` where `PACKAGES.rds` never gave one. The files come from the CDN mirror `https://cloud.r-project.org`, four at a time, with up to three tries each and a growing wait between tries, under a User-Agent that names this repository. A current file is read from `src/contrib/` and an archived one from `src/contrib/Archive/<package>/`; a `gone` file is not downloaded, since its address now serves another file or none. Before anything is stored, the download must be exactly `size_bytes` long and, where the row has CRAN's MD5, must match it. A file that does not verify, or does not download, stores nothing, is named in the run log, and is tried again on a later run. `hashed_at` is when the hashes were stored. A file with a `sha256` is never downloaded again, and a re-upload of the same version is a new revision, hashed on its own.
+
+A run hashes at most 12,000 files and starts no download after 15 minutes of hashing, or 20 minutes after the job started, whichever comes first, so the publish step always runs inside the 30-minute job timeout. Each batch is stored as it finishes, so a run that stops on its budget publishes what it hashed. Current files go first, then archived files of packages still on CRAN, newest release first, then the rest. When hashing stops on an unexpected error, the run fails after publishing.
+
+The table carries forward from the previous release, hashes included. If that release cannot be read, or downloads as an empty file, nothing is published. If the current index fails or lists fewer than 15,000 files, or more than 500 new files appear for versions already recorded, the previous table is kept as it was, `tarballs_state` in `manifest.json` says why, and the run fails after publishing so that someone looks. When building the day's file list stops with an error, the error text is printed in the run log and stored as `tarballs_error` in `manifest.json`.
 
 ## Output
 
@@ -71,10 +75,10 @@ The table carries forward from the previous release. If that release cannot be r
   `replaced`), and `reason`, keyed by `(package, seq)`.
 - `cran_archive_action_counts` - a histogram of the lineage: one row per
   `action` with its total count `n` across all packages.
-- `cran_tarballs` - one row per source tarball file: `package`, `version`, `revision`, `size_bytes`, `mtime` (UTC), `md5sum`, `listing` (`current`, `archive` or `gone`), `first_seen` and `last_seen`, keyed by `(package, version, revision)`.
+- `cran_tarballs` - one row per source tarball file: `package`, `version`, `revision`, `size_bytes`, `mtime` (UTC), `md5sum`, `listing` (`current`, `archive` or `gone`), `first_seen`, `last_seen`, `sha256` and `hashed_at` (UTC, NULL until the file is hashed), keyed by `(package, version, revision)`.
 
 A `manifest.json` accompanies the database and carries a `changed` flag so
-downstream consumers can skip unchanged rebuilds, plus `n_tarballs`, `tarball_revisions_new`, `tarballs_state` (`cold_start`, `updated`, `carried`, `storm`, `unreachable` or `skipped`) and `tarballs_error` (null unless building the day's file list stopped with an error).
+downstream consumers can skip unchanged rebuilds, plus `n_tarballs`, `tarball_revisions_new`, `tarballs_state` (`cold_start`, `updated`, `carried`, `storm`, `unreachable` or `skipped`) and `tarballs_error` (null unless building the day's file list stopped with an error). For the hashes it carries `tarballs_hashed` (this run), `tarballs_to_hash` (listed files still without a `sha256`), `tarball_hash_mismatches`, `tarball_hash_failures` and `tarball_hash_stop` (`done`, `count`, `time`, `error` or `skipped`); the counts are null when hashing was skipped.
 
 ## Running
 

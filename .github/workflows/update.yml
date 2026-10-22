@@ -22,6 +22,10 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
+      # Hashing stops starting downloads a set time after this, however long
+      # the setup steps took, so the publish step runs inside the timeout.
+      - name: Record when the job started
+        run: echo "JOB_STARTED_AT=$(date +%s)" >> "$GITHUB_ENV"
       - uses: actions/checkout@v7
       - uses: r-lib/actions/setup-r@v2
         with:
@@ -76,6 +80,19 @@ jobs:
         run: |
           STATE=$(jq -r '.tarballs_state' out/manifest.json)
           echo "cran_tarballs: $STATE, $(jq -r '.n_tarballs' out/manifest.json) rows, $(jq -r '.tarball_revisions_new' out/manifest.json) new files"
+          HASH_STOP=$(jq -r '.tarball_hash_stop' out/manifest.json)
+          MISMATCHES=$(jq -r '.tarball_hash_mismatches // 0' out/manifest.json)
+          FAILURES=$(jq -r '.tarball_hash_failures // 0' out/manifest.json)
+          echo "cran_tarballs hashes: $(jq -r '.tarballs_hashed' out/manifest.json) hashed this run, $(jq -r '.tarballs_to_hash' out/manifest.json) still to hash, $MISMATCHES mismatches, $FAILURES failed downloads (stopped: $HASH_STOP)"
+          # A file that did not verify or download stored nothing and is tried
+          # again next run; the run log names each one.
+          if [ "$MISMATCHES" != "0" ] || [ "$FAILURES" != "0" ]; then
+            echo "::warning::cran_tarballs: $MISMATCHES files did not match their record and $FAILURES failed to download"
+          fi
+          if [ "$HASH_STOP" = "error" ]; then
+            echo "::error::cran_tarballs hashing stopped on an error; the run log has it"
+            exit 1
+          fi
           # Any other state left the table as it was or unpublished.
           case "$STATE" in
             cold_start|updated) ;;

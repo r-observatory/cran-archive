@@ -272,7 +272,8 @@ test_that("export_tarballs writes the keyed, WITHOUT ROWID table with its check"
   sql <- RSQLite::dbGetQuery(con, "SELECT sql FROM sqlite_master WHERE name = 'cran_tarballs'")$sql
   expect_match(sql, "WITHOUT ROWID", fixed = TRUE)
   expect_match(sql, "PRIMARY KEY (package, version, revision)", fixed = TRUE)
-  expect_error(RSQLite::dbExecute(con, "INSERT INTO cran_tarballs VALUES
+  expect_error(RSQLite::dbExecute(con, "INSERT INTO cran_tarballs
+    (package, version, revision, size_bytes, mtime, md5sum, listing, first_seen, last_seen) VALUES
     ('cli', '9.9', 1, 10, '2026-10-01T00:00:00Z', NULL, 'current', '2026-10-02', '2026-10-01')"),
     "CHECK constraint failed")
 })

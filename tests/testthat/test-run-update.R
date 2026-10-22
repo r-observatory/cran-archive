@@ -469,3 +469,138 @@ test_that("run_update: an unreachable prior database skips cran_tarballs as well
   expect_equal(res$manifest$tarballs_state, "skipped")
   expect_null(jsonlite::read_json(file.path(out, "manifest.json"))$tarballs_error)
 })
+
+# ---------------------------------------------------------------------------
+# cran_tarballs hashes
+# ---------------------------------------------------------------------------
+
+# The stub's one current file is the 5 bytes "hello", whose MD5 FIXTURE_MD5 gives.
+.CURRENT_HELLO <- data.frame(size = 5, mtime = as.POSIXct("2024-02-01", tz = "UTC"),
+                             row.names = "PkgCurrent_0.7.tar.gz")
+.HELLO_SHA256 <- "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824"
+
+# Every file the stub lists, laid out as the mirror serves them: each archived
+# file is 1000 bytes, as FIXTURE_ARCHIVE records.
+.stub_mirror <- function(env = parent.frame()) {
+  root <- withr::local_tempdir(.local_envir = env)
+  put <- function(path, text) {
+    f <- file.path(root, path)
+    dir.create(dirname(f), recursive = TRUE, showWarnings = FALSE)
+    writeBin(charToRaw(text), f)
+  }
+  for (pkg in names(FIXTURE_ARCHIVE)) {
+    for (p in rownames(FIXTURE_ARCHIVE[[pkg]])) {
+      put(file.path("src", "contrib", "Archive", p), formatC(p, width = -1000))
+    }
+  }
+  put("src/contrib/PkgCurrent_0.7.tar.gz", "hello")
+  root
+}
+
+.stub_fetch <- function(root) {
+  log <- new.env()
+  log$urls <- character(0)
+  log$fetch <- function(urls, destfiles) {
+    log$urls <- c(log$urls, urls)
+    src <- file.path(root, substring(urls, nchar(TARBALL_MIRROR_URL) + 2L))
+    ok <- file.exists(src)
+    file.copy(src[ok], destfiles[ok], overwrite = TRUE)
+    ok
+  }
+  log
+}
+
+.hashing_io <- function(fetch, ...) {
+  io <- make_stub_io(current_rds = .CURRENT_HELLO, ...)
+  io$fetch_tarballs <- fetch
+  io
+}
+
+test_that("run_update: a first run hashes every listed file, current first, and reports the counts", {
+  tmp <- withr::local_tempdir(); out <- file.path(tmp, "out")
+  f <- .stub_fetch(.stub_mirror())
+  res <- suppressMessages(run_update(.hashing_io(f$fetch), out, force_full = TRUE,
+                                     min_current = 0L, min_archive = 0L))
+  t <- .read_tarballs(out)
+  expect_equal(nrow(t), 6L)
+  expect_false(anyNA(t$sha256))
+  expect_false(anyNA(t$md5sum))
+  expect_false(anyNA(t$hashed_at))
+  expect_equal(t$sha256[t$package == "PkgCurrent" & t$listing == "current"], .HELLO_SHA256)
+  expect_equal(f$urls[1], paste0(TARBALL_MIRROR_URL, "/src/contrib/PkgCurrent_0.7.tar.gz"))
+  expect_length(f$urls, 6L)
+
+  m <- res$manifest
+  expect_equal(m$tarballs_hashed, 6L)
+  expect_equal(m$tarballs_to_hash, 0L)
+  expect_equal(m$tarball_hash_mismatches, 0L)
+  expect_equal(m$tarball_hash_failures, 0L)
+  expect_equal(m$tarball_hash_stop, "done")
+  on_disk <- jsonlite::read_json(file.path(out, "manifest.json"))
+  expect_equal(on_disk$tarballs_hashed, 6L)
+  expect_equal(on_disk$tarballs_to_hash, 0L)
+  expect_equal(on_disk$tarball_hash_mismatches, 0L)
+  # The integrity core covers the file as it is after the hashes went in.
+  expect_equal(m$db_sha256, file_sha256(file.path(out, "cran-archive.db")))
+})
+
+test_that("run_update: a run stopped by its budget publishes what it hashed, and the next run goes on", {
+  tmp <- withr::local_tempdir(); out <- file.path(tmp, "out")
+  mirror <- .stub_mirror()
+  f1 <- .stub_fetch(mirror)
+  res1 <- suppressMessages(run_update(.hashing_io(f1$fetch), out, force_full = TRUE,
+                                      min_current = 0L, min_archive = 0L, hash_max_files = 2L))
+  expect_equal(res1$manifest$tarballs_hashed, 2L)
+  expect_equal(res1$manifest$tarballs_to_hash, 4L)
+  expect_equal(res1$manifest$tarball_hash_stop, "count")
+  t1 <- .read_tarballs(out)
+  expect_equal(sum(!is.na(t1$sha256)), 2L)
+
+  f2 <- .stub_fetch(mirror)
+  res2 <- suppressMessages(run_update(.hashing_io(f2$fetch, prev_tarballs = t1), out,
+                                      force_full = TRUE, min_current = 0L, min_archive = 0L))
+  expect_length(f2$urls, 4L)
+  expect_false(any(f2$urls %in% f1$urls))
+  expect_equal(res2$manifest$tarballs_hashed, 4L)
+  expect_equal(res2$manifest$tarballs_to_hash, 0L)
+  t2 <- .read_tarballs(out)
+  expect_false(anyNA(t2$sha256))
+  # The first run's hashes carried over as they were.
+  kept <- !is.na(t1$sha256)
+  expect_equal(t2$sha256[kept], t1$sha256[kept])
+  expect_equal(t2$hashed_at[kept], t1$hashed_at[kept])
+})
+
+test_that("run_update: a deadline already past hashes nothing and still publishes the table", {
+  tmp <- withr::local_tempdir(); out <- file.path(tmp, "out")
+  f <- .stub_fetch(.stub_mirror())
+  res <- suppressMessages(run_update(.hashing_io(f$fetch), out, force_full = TRUE,
+                                     min_current = 0L, min_archive = 0L,
+                                     hash_deadline = Sys.time() - 1))
+  expect_length(f$urls, 0L)
+  expect_equal(res$manifest$tarballs_state, "cold_start")
+  expect_equal(res$manifest$tarballs_hashed, 0L)
+  expect_equal(res$manifest$tarballs_to_hash, 6L)
+  expect_equal(res$manifest$tarball_hash_stop, "time")
+})
+
+test_that("run_update: nothing is hashed when the prior table could not be read", {
+  tmp <- withr::local_tempdir(); out <- file.path(tmp, "out")
+  f <- .stub_fetch(.stub_mirror())
+  io <- .hashing_io(f$fetch)
+  io$prev_tarballs <- function() stop("database disk image is malformed")
+  res <- suppressMessages(run_update(io, out, force_full = TRUE, min_current = 0L, min_archive = 0L))
+  expect_length(f$urls, 0L)
+  expect_equal(res$manifest$tarball_hash_stop, "skipped")
+  on_disk <- jsonlite::read_json(file.path(out, "manifest.json"))
+  expect_null(on_disk$tarballs_hashed)
+  expect_null(on_disk$tarballs_to_hash)
+  expect_equal(on_disk$tarball_hash_stop, "skipped")
+})
+
+test_that("run_update: an io without a fetch leaves the hashes alone", {
+  tmp <- withr::local_tempdir(); out <- file.path(tmp, "out")
+  res <- run_update(make_stub_io(), out, force_full = TRUE, min_current = 0L, min_archive = 0L)
+  expect_equal(res$manifest$tarball_hash_stop, "skipped")
+  expect_true(all(is.na(.read_tarballs(out)$sha256)))
+})
